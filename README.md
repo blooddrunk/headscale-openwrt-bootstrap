@@ -50,6 +50,72 @@ cd /root/headscale-openwrt-bootstrap
 OpenWrt 会检查 `opkg`/`apk`、`uci`、`ubus`、`fw4`、`nft`、`ip`、`ss`
 和 Tailscale CLI。缺少工具会报告为 unknown/blocked，不会自动安装。
 
+## 从 raw.githubusercontent.com 直接获取
+
+与单文件脚本不同，本项目的两个入口会相对路径加载 `lib/` 下的四个
+库文件。因此不支持只下载一个入口后执行
+`curl .../headscale-vps.sh | sh`；这样会缺少依赖，也不适合作为
+安全的运维入口。可以从 GitHub raw 地址下载保持目录结构的最小运行包：
+
+~~~sh
+# 方便测试可使用 main；生产环境建议改成已审阅的完整 commit SHA。
+RAW_REF=main
+RAW_BASE=https://raw.githubusercontent.com/blooddrunk/headscale-openwrt-bootstrap/$RAW_REF
+
+# 持久保存脚本副本（OpenWrt 可用 /root；VPS 可用 /usr/local/libexec/...）。
+TARGET=/root/headscale-openwrt-bootstrap
+# 仅临时运行时，改用下面两行，并在退出时删除 TARGET：
+# TARGET=$(mktemp -d /tmp/headscale-openwrt-bootstrap.XXXXXX)
+# trap 'rm -rf "$TARGET"' EXIT HUP INT TERM
+
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$2" "$1"
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -O "$2" "$1"
+    else
+        echo '需要 curl、wget 或 uclient-fetch' >&2
+        return 1
+    fi
+}
+
+mkdir -p "$TARGET/lib"
+for path in \
+    headscale-vps.sh tailscale-openwrt.sh \
+    lib/log.sh lib/common.sh lib/backup.sh lib/version.sh
+do
+    mkdir -p "$TARGET/$(dirname "$path")"
+    fetch "$RAW_BASE/$path" "$TARGET/$path"
+done
+
+# 下载后先做语法检查，再运行只读命令。
+for path in \
+    headscale-vps.sh tailscale-openwrt.sh \
+    lib/log.sh lib/common.sh lib/backup.sh lib/version.sh
+do
+    sh -n "$TARGET/$path"
+done
+chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
+
+# OpenWrt 示例；VPS 使用同一下载目录运行 headscale-vps.sh。
+"$TARGET/tailscale-openwrt.sh" \
+    --login-server https://hs.example.com \
+    discover
+~~~
+
+这段操作只是下载并保存脚本副本，不会安装软件包、注册服务或修改
+netifd/UCI/fw4。下载到持久目录后，可重复执行
+`$TARGET/tailscale-openwrt.sh status` 或
+`$TARGET/headscale-vps.sh status`。当前 Milestone 的
+`install`、`apply`、`join`、`update` 等写操作仍会 fail-closed；
+raw 地址不会绕过这些限制。
+
+若使用固定 commit，建议把 `RAW_REF` 改成完整 SHA，并在运行前通过
+浏览器或 GitHub 界面审阅对应版本。`main` 会随仓库更新，不适合需要
+可重复审计的生产执行。
+
 ## Milestone 1 命令
 
 两个脚本都支持：
