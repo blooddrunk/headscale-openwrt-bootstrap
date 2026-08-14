@@ -1,0 +1,115 @@
+#!/bin/sh
+
+set -eu
+
+TEST_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P)
+PROJECT_DIR=$(CDPATH= cd "$TEST_DIR/.." 2>/dev/null && pwd -P)
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/headscale-bootstrap-test.XXXXXX")
+trap 'rm -rf "$TMP_DIR"' EXIT HUP INT TERM
+
+VPS_SCRIPT=$PROJECT_DIR/headscale-vps.sh
+OPENWRT_SCRIPT=$PROJECT_DIR/tailscale-openwrt.sh
+VPS_BIN=$TEST_DIR/fixtures/bin-vps
+OPENWRT_BIN=$TEST_DIR/fixtures/bin-openwrt
+
+fail() {
+    printf 'FAIL: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_contains() {
+    assert_text=$1
+    assert_needle=$2
+    printf '%s\n' "$assert_text" | grep -qF "$assert_needle" || fail "missing: $assert_needle"
+}
+
+assert_json_value() {
+    assert_json=$1
+    assert_filter=$2
+    printf '%s\n' "$assert_json" | jq -e "$assert_filter" >/dev/null || fail "JSON assertion failed: $assert_filter"
+}
+
+assert_code() {
+    assert_expected=$1
+    shift
+    set +e
+    assert_output=$("$@" 2>&1)
+    assert_actual=$?
+    set -e
+    [ "$assert_actual" -eq "$assert_expected" ] || {
+        printf '%s\n' "$assert_output" >&2
+        fail "expected exit $assert_expected, got $assert_actual"
+    }
+    printf '%s\n' "$assert_output"
+}
+
+chmod +x "$TEST_DIR"/fixtures/bin-vps/* "$TEST_DIR"/fixtures/bin-openwrt/*
+
+VPS_ROOT=$TMP_DIR/vps
+OPENWRT_ROOT=$TMP_DIR/openwrt
+mkdir -p "$VPS_ROOT" "$OPENWRT_ROOT"
+cp -a "$TEST_DIR/fixtures/vps/." "$VPS_ROOT/"
+cp -a "$TEST_DIR/fixtures/openwrt/." "$OPENWRT_ROOT/"
+printf 'PRIVATE-STATE-MARKER\n' > "$OPENWRT_ROOT/etc/tailscale/tailscaled.state"
+printf 'PRIVATE-DB-MARKER\n' > "$VPS_ROOT/var/lib/headscale/db.sqlite"
+chmod 600 "$OPENWRT_ROOT/etc/tailscale/tailscaled.state" "$VPS_ROOT/var/lib/headscale/db.sqlite"
+
+VPS_DISCOVER=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" --expected-public-ip 203.0.113.10 discover --json)
+assert_json_value "$VPS_DISCOVER" '.headscale_version == "headscale version 0.29.3" and .docker_network_mode == "host" and .panel_mount_www == "yes" and .panel_mount_confd == "yes" and .dns_match == "match" and .udp_3478 == "free"'
+
+VPS_PLAN=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 plan --json)
+assert_json_value "$VPS_PLAN" '.blocked == false and .effective_proxy == "1panel" and .mutates_system == "no"'
+
+VPS_STATUS=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" status --json)
+assert_json_value "$VPS_STATUS" '.ok == true and .configtest == "pass" and .local_health == "200" and .public_health == "200"'
+
+VPS_UNSAFE_ROOT=$TMP_DIR/vps-unsafe
+mkdir -p "$VPS_UNSAFE_ROOT"
+cp -a "$VPS_ROOT/." "$VPS_UNSAFE_ROOT/"
+sed -i 's/listen_addr: 127.0.0.1:8080/listen_addr: 0.0.0.0:8080/' "$VPS_UNSAFE_ROOT/etc/headscale/config.yaml"
+VPS_UNSAFE_PLAN=$(assert_code 2 env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_UNSAFE_ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 plan --json)
+assert_contains "$VPS_UNSAFE_PLAN" 'existing-config-unsafe'
+
+OPENWRT_DISCOVER=$(env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_ROOT" discover --json)
+assert_json_value "$OPENWRT_DISCOVER" '.unsafe_luci_helper == "yes" and .control_url == "https://hs.example.com" and .advertise_routes == "192.168.10.0/24" and .network_tailscale == "no"'
+
+OPENWRT_PLAN=$(assert_code 2 env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_ROOT" --login-server https://other.example.test plan --json)
+assert_contains "$OPENWRT_PLAN" 'different-existing-controlurl'
+
+OPENWRT_NETWORK_CONFLICT_ROOT=$TMP_DIR/openwrt-network-conflict
+mkdir -p "$OPENWRT_NETWORK_CONFLICT_ROOT"
+cp -a "$OPENWRT_ROOT/." "$OPENWRT_NETWORK_CONFLICT_ROOT/"
+printf "\nconfig interface 'tailscale'\n\toption proto 'none'\n" >> "$OPENWRT_NETWORK_CONFLICT_ROOT/etc/config/network"
+OPENWRT_NETWORK_CONFLICT=$(assert_code 2 env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_NETWORK_CONFLICT_ROOT" --login-server https://hs.example.com plan --json)
+assert_contains "$OPENWRT_NETWORK_CONFLICT" 'existing-network-tailscale-section'
+
+OPENWRT_RESERVED=$(assert_code 2 env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_ROOT" apply)
+assert_contains "$OPENWRT_RESERVED" 'fail-closed'
+
+VPS_BACKUP=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" backup)
+VPS_BACKUP_PATH=$(printf '%s\n' "$VPS_BACKUP" | sed -n 's/^Backup created: //p')
+[ -n "$VPS_BACKUP_PATH" ] || fail 'VPS backup path missing'
+[ -f "$VPS_BACKUP_PATH/manifest.sha256" ] || fail 'VPS manifest missing'
+[ -f "$VPS_BACKUP_PATH/source/etc/headscale/config.yaml" ] || fail 'VPS config not backed up'
+[ -f "$VPS_BACKUP_PATH/source/var/lib/headscale/db.sqlite" ] || fail 'VPS database not backed up'
+[ "$(stat -c '%a' "$VPS_BACKUP_PATH")" = 700 ] || fail 'VPS backup directory is not private'
+(cd "$VPS_BACKUP_PATH" && sha256sum -c manifest.sha256 >/dev/null) || fail 'VPS manifest verification failed'
+! printf '%s\n' "$VPS_BACKUP" | grep -qF 'PRIVATE-DB-MARKER' || fail 'VPS secret leaked to backup output'
+VPS_BACKUP_AGAIN=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" backup)
+VPS_BACKUP_AGAIN_PATH=$(printf '%s\n' "$VPS_BACKUP_AGAIN" | sed -n 's/^Backup created: //p')
+[ "$VPS_BACKUP_AGAIN_PATH" != "$VPS_BACKUP_PATH" ] || fail 'repeated VPS backup reused a directory'
+VPS_BACKUP_JSON=$(env PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VPS_ROOT" backup --json)
+assert_json_value "$VPS_BACKUP_JSON" '.command == "backup" and .secret_contents == "not-logged"'
+
+OPENWRT_BACKUP=$(env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_ROOT" backup)
+OPENWRT_BACKUP_PATH=$(printf '%s\n' "$OPENWRT_BACKUP" | sed -n 's/^Backup created: //p')
+[ -n "$OPENWRT_BACKUP_PATH" ] || fail 'OpenWrt backup path missing'
+[ -f "$OPENWRT_BACKUP_PATH/manifest.sha256" ] || fail 'OpenWrt manifest missing'
+[ -f "$OPENWRT_BACKUP_PATH/source/etc/tailscale/tailscaled.state" ] || fail 'OpenWrt state not backed up'
+[ "$(stat -c '%a' "$OPENWRT_BACKUP_PATH")" = 700 ] || fail 'OpenWrt backup directory is not private'
+(cd "$OPENWRT_BACKUP_PATH" && sha256sum -c manifest.sha256 >/dev/null) || fail 'OpenWrt manifest verification failed'
+! printf '%s\n' "$OPENWRT_BACKUP" | grep -qF 'PRIVATE-STATE-MARKER' || fail 'OpenWrt state leaked to backup output'
+OPENWRT_BACKUP_JSON=$(env PATH="$OPENWRT_BIN:$PATH" "$OPENWRT_SCRIPT" --root "$OPENWRT_ROOT" backup --json)
+assert_json_value "$OPENWRT_BACKUP_JSON" '.command == "backup" and .secret_contents == "not-logged"'
+
+printf 'Milestone 1 checks passed.\n'

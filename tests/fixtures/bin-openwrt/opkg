@@ -1,0 +1,13 @@
+#!/bin/sh
+case "$1" in
+    status)
+        case "$2" in
+            tailscale) printf 'Package: tailscale\nStatus: install ok installed\nVersion: 1.98.3-r1\n' ;;
+            luci-app-tailscale) printf 'Package: luci-app-tailscale\nStatus: install ok installed\nVersion: 1.2.6-r1\n' ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    list-installed) printf 'tailscale - 1.98.3-r1\nluci-app-tailscale - 1.2.6-r1\n' ;;
+    *) exit 0 ;;
+esac
+

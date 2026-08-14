@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$*" in
+    *'link show tailscale0'*) printf '7: tailscale0: <POINTOPOINT> mtu 1280\n' ;;
+    *'-4 -o addr show dev tailscale0'*) printf '7: tailscale0    inet 100.64.0.1/32 scope global tailscale0\n' ;;
+    *'-4 route show scope link'*) printf '192.168.10.0/24 dev br-lan proto kernel scope link\n' ;;
+    *) : ;;
+esac
+

@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$1" in
+    ahosts) printf '203.0.113.10 STREAM hs.example.com\n203.0.113.10 DGRAM hs.example.com\n' ;;
+esac
+

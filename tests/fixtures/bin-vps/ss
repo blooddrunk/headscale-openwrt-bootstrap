@@ -1,0 +1,13 @@
+#!/bin/sh
+case "$*" in
+    *-lun*) printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n' ;;
+    *)
+        printf 'Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n'
+        printf 'tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n'
+        printf 'tcp LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'
+        printf 'tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\n'
+        printf 'tcp LISTEN 0 128 127.0.0.1:9090 0.0.0.0:*\n'
+        printf 'tcp LISTEN 0 128 127.0.0.1:50443 0.0.0.0:*\n'
+        ;;
+esac
+

@@ -1,0 +1,3 @@
+#!/bin/sh
+printf '{"model":"fixture-router","release":{"distribution":"Kwrt","version":"25.12-SNAPSHOT"}}\n'
+

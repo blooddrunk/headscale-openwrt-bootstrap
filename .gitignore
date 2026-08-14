@@ -1,0 +1,17 @@
+# Operational secrets and state; never commit these.
+*.state
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*authkey*
+*preauth*
+*privkey*
+*.pem
+*.key
+
+# Generated private snapshots and test output.
+backups/
+tests/tmp/
+**/.INCOMPLETE
+**/manifest.sha256
+

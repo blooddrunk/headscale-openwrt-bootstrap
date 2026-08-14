@@ -1,0 +1,997 @@
+#!/bin/sh
+
+# Headscale + OpenWrt bootstrap, router side.
+#
+# Milestone 1 is deliberately inspection-first.  discover, plan and status do
+# not invoke any init script, do not call network reload, and do not write UCI.
+# backup creates a private snapshot only.  Mutating commands remain fail-closed
+# until the later Milestones implement their transaction/rollback phases.
+
+set -f
+umask 077
+
+OPENWRT_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P) || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/log.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/common.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/backup.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/version.sh" || exit 1
+
+OPENWRT_PROGRAM=tailscale-openwrt.sh
+OPENWRT_COMMAND=
+OPENWRT_LOGIN_SERVER=
+OPENWRT_AUTH_KEY_FILE=
+OPENWRT_HOSTNAME=
+OPENWRT_SERVICE_MODE=auto
+OPENWRT_ACCEPT_DNS=false
+OPENWRT_ACCEPT_ROUTES=false
+OPENWRT_SUBNET=
+OPENWRT_ENABLE_SUBNET=false
+OPENWRT_ALLOW_WAN_UDP=false
+OPENWRT_BACKUP_DIR=/root/tailscale-bootstrap-backups
+BOOTSTRAP_ROOT=/
+BOOTSTRAP_DRY_RUN=0
+BOOTSTRAP_YES=0
+BOOTSTRAP_JSON=0
+BOOTSTRAP_QUIET=0
+BOOTSTRAP_VERBOSE=0
+
+openwrt_usage() {
+    cat <<'EOF'
+Usage:
+  tailscale-openwrt.sh [global options] <command>
+
+Milestone 1 commands (discover/status/plan are read-only):
+  discover                 Inspect packages, helpers, prefs, UCI and fw4 safely.
+  plan                     Show a guarded future plan; never changes the router.
+  status                   Check current daemon/control/firewall/UCI state.
+  verify                   Read-only verification alias for status in Milestone 1.
+  backup                   Create a private timestamped snapshot; no service stop.
+
+Reserved fail-closed commands:
+  install apply join update enable-subnet disable-subnet allow-wan-udp
+  rollback cleanup purge-identity
+
+Options:
+  --login-server URL
+  --auth-key-file FILE     Path is checked, never read to stdout or logs.
+  --hostname NAME
+  --service-mode auto|core|native
+  --accept-dns true|false
+  --accept-routes true|false
+  --subnet CIDR
+  --enable-subnet[=true|false]
+  --allow-wan-udp[=true|false]
+  --root DIR                Test/fixture root; default is /.
+  --backup-dir DIR          Backup directory in the selected root namespace.
+  --dry-run                 Accepted for CLI compatibility; all Milestone 1 commands are non-mutating.
+  --yes                     Accepted for future explicit operations; not sufficient for reserved commands.
+  --json --quiet --verbose
+  -h, --help
+
+Hard boundaries in this milestone:
+  - never invoke the stock /etc/init.d/tailscale stop/reload/restart;
+  - never invoke /etc/init.d/network reload;
+  - never run tailscale up --reset;
+  - never write network/firewall UCI or enable exit-node behavior;
+  - never print tailscaled.state or auth-key contents;
+  - simultaneous multi-Headscale support is not claimed.
+EOF
+}
+
+openwrt_parse_bool() {
+    case "$1" in
+        true|yes|1|on) printf 'true\n' ;;
+        false|no|0|off) printf 'false\n' ;;
+        *) die "invalid boolean: $1 (expected true or false)" ;;
+    esac
+}
+
+openwrt_need_value() {
+    [ "$#" -ge 2 ] || die "option $1 needs a value"
+}
+
+openwrt_parse_option_bool() {
+    openwrt_bool_arg=$1
+    openwrt_bool_default=$2
+    case "$openwrt_bool_arg" in
+        true|yes|1|on|false|no|0|off) openwrt_parse_bool "$openwrt_bool_arg" ;;
+        *) printf '%s\n' "$openwrt_bool_default" ;;
+    esac
+}
+
+openwrt_validate_options() {
+    case "$OPENWRT_SERVICE_MODE" in
+        auto|core|native) ;;
+        *) die "unsupported --service-mode: $OPENWRT_SERVICE_MODE" ;;
+    esac
+    case "$OPENWRT_LOGIN_SERVER" in
+        '') ;;
+        https://?*) OPENWRT_LOGIN_SERVER=$(bootstrap_normalize_url "$OPENWRT_LOGIN_SERVER") ;;
+        *) die '--login-server must be an HTTPS URL' ;;
+    esac
+    if [ -n "$OPENWRT_AUTH_KEY_FILE" ] && [ ! -f "$OPENWRT_AUTH_KEY_FILE" ]; then
+        die "--auth-key-file is not a regular file: $OPENWRT_AUTH_KEY_FILE"
+    fi
+    if [ -n "$OPENWRT_AUTH_KEY_FILE" ]; then
+        OPENWRT_AUTH_KEY_MODE=$(bootstrap_file_mode "$OPENWRT_AUTH_KEY_FILE")
+        case "$OPENWRT_AUTH_KEY_MODE" in
+            400|600) ;;
+            *) die '--auth-key-file must be mode 0400 or 0600; key contents are never printed' ;;
+        esac
+    fi
+    if [ -n "$OPENWRT_SUBNET" ]; then
+        case "$OPENWRT_SUBNET" in
+            *[!0-9./]*) die "unsupported subnet syntax: $OPENWRT_SUBNET" ;;
+            */[0-9]|*/[1-2][0-9]|*/3[0-2]) ;;
+            *) die "subnet must be an IPv4 CIDR such as 192.168.10.0/24: $OPENWRT_SUBNET" ;;
+        esac
+    fi
+    case "$OPENWRT_BACKUP_DIR" in
+        /*) ;;
+        *) die '--backup-dir must be an absolute path in the selected root namespace' ;;
+    esac
+    case "$OPENWRT_BACKUP_DIR" in
+        /|*/../*|*/..|..|.) die 'refusing unsafe --backup-dir' ;;
+    esac
+}
+
+openwrt_parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            discover|plan|status|verify|backup|install|apply|join|update|enable-subnet|disable-subnet|allow-wan-udp|rollback|cleanup|purge-identity)
+                [ -z "$OPENWRT_COMMAND" ] || die "multiple commands supplied: $OPENWRT_COMMAND and $1"
+                OPENWRT_COMMAND=$1
+                shift
+                ;;
+            --login-server)
+                openwrt_need_value "$@"
+                OPENWRT_LOGIN_SERVER=$2
+                shift 2
+                ;;
+            --login-server=*) OPENWRT_LOGIN_SERVER=${1#*=}; shift ;;
+            --auth-key-file)
+                openwrt_need_value "$@"
+                OPENWRT_AUTH_KEY_FILE=$2
+                shift 2
+                ;;
+            --auth-key-file=*) OPENWRT_AUTH_KEY_FILE=${1#*=}; shift ;;
+            --hostname)
+                openwrt_need_value "$@"
+                OPENWRT_HOSTNAME=$2
+                shift 2
+                ;;
+            --hostname=*) OPENWRT_HOSTNAME=${1#*=}; shift ;;
+            --service-mode)
+                openwrt_need_value "$@"
+                OPENWRT_SERVICE_MODE=$2
+                shift 2
+                ;;
+            --service-mode=*) OPENWRT_SERVICE_MODE=${1#*=}; shift ;;
+            --accept-dns)
+                openwrt_need_value "$@"
+                OPENWRT_ACCEPT_DNS=$(openwrt_parse_bool "$2")
+                shift 2
+                ;;
+            --accept-dns=*) OPENWRT_ACCEPT_DNS=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --accept-routes)
+                openwrt_need_value "$@"
+                OPENWRT_ACCEPT_ROUTES=$(openwrt_parse_bool "$2")
+                shift 2
+                ;;
+            --accept-routes=*) OPENWRT_ACCEPT_ROUTES=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --subnet)
+                openwrt_need_value "$@"
+                OPENWRT_SUBNET=$2
+                shift 2
+                ;;
+            --subnet=*) OPENWRT_SUBNET=${1#*=}; shift ;;
+            --enable-subnet)
+                if [ "$#" -ge 2 ]; then
+                    case "$2" in
+                        true|yes|1|on|false|no|0|off)
+                            OPENWRT_ENABLE_SUBNET=$(openwrt_parse_bool "$2")
+                            shift 2
+                            ;;
+                        *) OPENWRT_ENABLE_SUBNET=true; shift ;;
+                    esac
+                else
+                    OPENWRT_ENABLE_SUBNET=true
+                    shift
+                fi
+                ;;
+            --enable-subnet=*) OPENWRT_ENABLE_SUBNET=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --allow-wan-udp)
+                if [ "$#" -ge 2 ]; then
+                    case "$2" in
+                        true|yes|1|on|false|no|0|off)
+                            OPENWRT_ALLOW_WAN_UDP=$(openwrt_parse_bool "$2")
+                            shift 2
+                            ;;
+                        *) OPENWRT_ALLOW_WAN_UDP=true; shift ;;
+                    esac
+                else
+                    OPENWRT_ALLOW_WAN_UDP=true
+                    shift
+                fi
+                ;;
+            --allow-wan-udp=*) OPENWRT_ALLOW_WAN_UDP=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --root)
+                openwrt_need_value "$@"
+                BOOTSTRAP_ROOT=$2
+                shift 2
+                ;;
+            --root=*) BOOTSTRAP_ROOT=${1#*=}; shift ;;
+            --backup-dir)
+                openwrt_need_value "$@"
+                OPENWRT_BACKUP_DIR=$2
+                shift 2
+                ;;
+            --backup-dir=*) OPENWRT_BACKUP_DIR=${1#*=}; shift ;;
+            --dry-run) BOOTSTRAP_DRY_RUN=1; shift ;;
+            --yes|--yes-i-understand) BOOTSTRAP_YES=1; shift ;;
+            --json) BOOTSTRAP_JSON=1; shift ;;
+            --quiet) BOOTSTRAP_QUIET=1; shift ;;
+            --verbose) BOOTSTRAP_VERBOSE=1; shift ;;
+            -h|--help) openwrt_usage; exit 0 ;;
+            --) shift; while [ "$#" -gt 0 ]; do die "unexpected argument after --: $1"; done ;;
+            *) die "unknown option or command: $1" ;;
+        esac
+    done
+
+    [ -n "$OPENWRT_COMMAND" ] || { openwrt_usage >&2; exit 2; }
+    openwrt_validate_options
+    BOOTSTRAP_ROOT=$(bootstrap_normalize_root "$BOOTSTRAP_ROOT") || die '--root is not an accessible directory'
+}
+
+openwrt_target_path() {
+    bootstrap_root_path "$1"
+}
+
+openwrt_uci_option_from_file() {
+    openwrt_uci_file=$1
+    openwrt_uci_option=$2
+    [ -r "$openwrt_uci_file" ] || return 1
+    awk -v wanted="$openwrt_uci_option" '
+        $1 == "option" && $2 == wanted {
+            value=$0
+            sub("^[[:space:]]*option[[:space:]]+" wanted "[[:space:]]+", "", value)
+            gsub(/^['\''"]|['\''"]$/, "", value)
+            print value
+            exit
+        }
+    ' "$openwrt_uci_file" 2>/dev/null
+}
+
+openwrt_section_in_file() {
+    openwrt_section_file=$1
+    openwrt_section_type=$2
+    openwrt_section_name=$3
+    [ -r "$openwrt_section_file" ] || return 1
+    awk -v wanted_type="$openwrt_section_type" -v wanted_name="$openwrt_section_name" '
+        $1 == "config" && $2 == wanted_type {
+            name=$3
+            gsub(/^['\''"]|['\''"]$/, "", name)
+            if (name == wanted_name) found=1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$openwrt_section_file" 2>/dev/null
+}
+
+openwrt_scan_unsafe_file() {
+    openwrt_scan_file=$1
+    [ -r "$openwrt_scan_file" ] || return 0
+
+    if grep -qF 'tailscale up --reset' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match tailscale-up-reset; fi
+    if grep -qF '/etc/init.d/network reload' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match network-reload; fi
+    if grep -qF 'uci set network.tailscale' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match uci-network-tailscale; fi
+    if grep -qF 'uci commit network' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match uci-commit-network; fi
+    if grep -qF 'tailscale_helper' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match helper-call; fi
+    if grep -qF 'stop_instance' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match stop-instance; fi
+    if grep -qF '/etc/init.d/tailscale stop' "$openwrt_scan_file" 2>/dev/null; then openwrt_record_unsafe_match stock-stop; fi
+}
+
+openwrt_record_unsafe_match() {
+    openwrt_match_name=$1
+    case " $OPENWRT_UNSAFE_MATCHES " in
+        *" $openwrt_match_name "*) ;;
+        *) OPENWRT_UNSAFE_MATCHES="$OPENWRT_UNSAFE_MATCHES $openwrt_match_name" ;;
+    esac
+}
+
+openwrt_core_fingerprint() {
+    openwrt_core_file=$1
+    if [ ! -f "$openwrt_core_file" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+    if grep -qF 'procd_open_instance main' "$openwrt_core_file" 2>/dev/null \
+        && grep -qF '/usr/sbin/tailscaled' "$openwrt_core_file" 2>/dev/null \
+        && grep -qF -e '--state /etc/tailscale/tailscaled.state' "$openwrt_core_file" 2>/dev/null \
+        && grep -qF -e '--port 41641' "$openwrt_core_file" 2>/dev/null \
+        && grep -qF 'TS_DEBUG_FIREWALL_MODE=nftables' "$openwrt_core_file" 2>/dev/null \
+        && ! grep -qF '/etc/init.d/network reload' "$openwrt_core_file" 2>/dev/null \
+        && ! grep -qF 'uci commit network' "$openwrt_core_file" 2>/dev/null; then
+        printf 'verified\n'
+    else
+        printf 'unverified\n'
+    fi
+}
+
+openwrt_parse_prefs() {
+    OPENWRT_PREFS_READABLE=no
+    OPENWRT_CURRENT_CONTROL_URL=
+    OPENWRT_CURRENT_ACCEPT_DNS=unknown
+    OPENWRT_CURRENT_ACCEPT_ROUTES=unknown
+    OPENWRT_CURRENT_ADVERTISE_ROUTES=
+    OPENWRT_EXIT_NODE_RISK=no
+    OPENWRT_TAILSCALE_STATE=unknown
+    OPENWRT_TAILSCALE_IP4=unknown
+    OPENWRT_PROFILE_STATE=unknown
+
+    if ! bootstrap_command_exists tailscale; then
+        return 0
+    fi
+
+    OPENWRT_PREFS_TEXT=$(tailscale debug prefs 2>/dev/null)
+    [ -n "$OPENWRT_PREFS_TEXT" ] && OPENWRT_PREFS_READABLE=yes
+    OPENWRT_CURRENT_CONTROL_URL=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"ControlURL"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+    [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] || OPENWRT_CURRENT_CONTROL_URL=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*ControlURL[[:space:]]*[:=][[:space:]]*//p' | sed 's/[", ]//g' | sed -n '1p')
+    OPENWRT_CURRENT_CONTROL_URL=$(bootstrap_normalize_url "$OPENWRT_CURRENT_CONTROL_URL")
+
+    OPENWRT_CURRENT_ACCEPT_DNS=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"CorpDNS"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | sed -n '1p')
+    [ -n "$OPENWRT_CURRENT_ACCEPT_DNS" ] || OPENWRT_CURRENT_ACCEPT_DNS=unknown
+    OPENWRT_CURRENT_ACCEPT_ROUTES=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"RouteAll"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | sed -n '1p')
+    [ -n "$OPENWRT_CURRENT_ACCEPT_ROUTES" ] || OPENWRT_CURRENT_ACCEPT_ROUTES=unknown
+    OPENWRT_CURRENT_ADVERTISE_ROUTES=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"AdvertiseRoutes"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' | sed -n '1p' | tr -d '"' | tr ',' ' ' | awk '{$1=$1; print}')
+    case "$OPENWRT_CURRENT_ADVERTISE_ROUTES" in
+        *0.0.0.0/0*|*::/0*) OPENWRT_EXIT_NODE_RISK=yes ;;
+    esac
+    if printf '%s\n' "$OPENWRT_PREFS_TEXT" | grep -qF '0.0.0.0/0' 2>/dev/null || printf '%s\n' "$OPENWRT_PREFS_TEXT" | grep -qF '::/0' 2>/dev/null; then
+        OPENWRT_EXIT_NODE_RISK=yes
+    fi
+    OPENWRT_EXIT_NODE_ID=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"ExitNodeID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+    [ -n "$OPENWRT_EXIT_NODE_ID" ] && OPENWRT_EXIT_NODE_RISK=yes
+    if grep -qF "option advertise_exit_node '1'" "$OPENWRT_CONFIG_TAILSCALE" 2>/dev/null || \
+        grep -qF -e '--advertise-exit-node' "$OPENWRT_CONFIG_TAILSCALE" 2>/dev/null; then
+        OPENWRT_EXIT_NODE_RISK=yes
+    fi
+
+    OPENWRT_STATUS_JSON=$(tailscale status --json 2>/dev/null)
+    OPENWRT_TAILSCALE_STATE=$(printf '%s\n' "$OPENWRT_STATUS_JSON" | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+    [ -n "$OPENWRT_TAILSCALE_STATE" ] || OPENWRT_TAILSCALE_STATE=unknown
+    OPENWRT_TAILSCALE_IP4=$(tailscale ip -4 2>/dev/null | sed -n '1p')
+    [ -n "$OPENWRT_TAILSCALE_IP4" ] || OPENWRT_TAILSCALE_IP4=unknown
+
+    OPENWRT_SWITCH_LIST=$(tailscale switch --list 2>/dev/null)
+    if [ -n "$OPENWRT_SWITCH_LIST" ]; then
+        OPENWRT_PROFILE_STATE=present
+    else
+        OPENWRT_PROFILE_STATE=none-or-unavailable
+    fi
+}
+
+openwrt_socket_state() {
+    openwrt_socket_port=$1
+    openwrt_socket_data=$2
+    [ -n "$openwrt_socket_data" ] || { printf 'unknown\n'; return 0; }
+    printf '%s\n' "$openwrt_socket_data" | awk -v wanted_port="$openwrt_socket_port" '
+        NR == 1 && $1 ~ /Netid|State/ { next }
+        {
+            address=$4
+            if ($1 ~ /^(tcp|udp|tcp6|udp6)$/ && $2 ~ /^(LISTEN|UNCONN|ESTAB|TIME-WAIT)$/) address=$5
+            if (address !~ (":" wanted_port "$")) next
+            found=1
+            if (address ~ /^0\.0\.0\.0:/ || address ~ /^\*:/ || address ~ /^\[::\]:/ || address ~ /^:::/) public=1
+        }
+        END {
+            if (public) print "public"
+            else if (found) print "present"
+            else print "free"
+        }
+    '
+}
+
+openwrt_collect_facts() {
+    OPENWRT_ETC_TAILSCALE=$(openwrt_target_path /etc/tailscale)
+    OPENWRT_TS_STATE=$(openwrt_target_path /etc/tailscale/tailscaled.state)
+    OPENWRT_INIT_TAILSCALE=$(openwrt_target_path /etc/init.d/tailscale)
+    OPENWRT_INIT_CORE=$(openwrt_target_path /etc/init.d/tailscale-core)
+    OPENWRT_CONFIG_TAILSCALE=$(openwrt_target_path /etc/config/tailscale)
+    OPENWRT_CONFIG_FIREWALL=$(openwrt_target_path /etc/config/firewall)
+    OPENWRT_CONFIG_NETWORK=$(openwrt_target_path /etc/config/network)
+    OPENWRT_HELPER=$(openwrt_target_path /usr/sbin/tailscale_helper)
+    OPENWRT_RC_DIR=$(openwrt_target_path /etc/rc.d)
+    OPENWRT_TUN=$(openwrt_target_path /dev/net/tun)
+    OPENWRT_PROC_IPV4_FORWARD=$(openwrt_target_path /proc/sys/net/ipv4/ip_forward)
+    OPENWRT_PROC_IPV6_FORWARD=$(openwrt_target_path /proc/sys/net/ipv6/conf/all/forwarding)
+
+    OPENWRT_TAILSCALE_DIR_PRESENT=no
+    OPENWRT_STATE_PRESENT=no
+    [ -d "$OPENWRT_ETC_TAILSCALE" ] && OPENWRT_TAILSCALE_DIR_PRESENT=yes
+    [ -f "$OPENWRT_TS_STATE" ] && OPENWRT_STATE_PRESENT=yes
+    OPENWRT_INIT_CORE_PRESENT=no
+    [ -f "$OPENWRT_INIT_CORE" ] && OPENWRT_INIT_CORE_PRESENT=yes
+    OPENWRT_CORE_FINGERPRINT=$(openwrt_core_fingerprint "$OPENWRT_INIT_CORE")
+    OPENWRT_STOCK_INIT_PRESENT=no
+    [ -f "$OPENWRT_INIT_TAILSCALE" ] && OPENWRT_STOCK_INIT_PRESENT=yes
+    OPENWRT_HELPER_PRESENT=no
+    [ -f "$OPENWRT_HELPER" ] && OPENWRT_HELPER_PRESENT=yes
+    OPENWRT_TAILSCALE_CONFIG_PRESENT=no
+    [ -f "$OPENWRT_CONFIG_TAILSCALE" ] && OPENWRT_TAILSCALE_CONFIG_PRESENT=yes
+
+    OPENWRT_PACKAGE_MANAGER=none
+    if bootstrap_command_exists opkg; then OPENWRT_PACKAGE_MANAGER=opkg; elif bootstrap_command_exists apk; then OPENWRT_PACKAGE_MANAGER=apk; fi
+    OPENWRT_UCI_PRESENT=no
+    bootstrap_command_exists uci && OPENWRT_UCI_PRESENT=yes
+    OPENWRT_TAILSCALE_PACKAGE=unknown
+    OPENWRT_LUCI_PACKAGE=unknown
+    if [ "$OPENWRT_PACKAGE_MANAGER" = opkg ]; then
+        if opkg status tailscale 2>/dev/null | grep -qF 'Status: install ok installed'; then OPENWRT_TAILSCALE_PACKAGE=installed; else OPENWRT_TAILSCALE_PACKAGE=absent; fi
+        if opkg status luci-app-tailscale 2>/dev/null | grep -qF 'Status: install ok installed'; then OPENWRT_LUCI_PACKAGE=installed; else OPENWRT_LUCI_PACKAGE=absent; fi
+    elif [ "$OPENWRT_PACKAGE_MANAGER" = apk ]; then
+        if apk info -e tailscale >/dev/null 2>&1; then OPENWRT_TAILSCALE_PACKAGE=installed; else OPENWRT_TAILSCALE_PACKAGE=absent; fi
+        if apk info -e luci-app-tailscale >/dev/null 2>&1; then OPENWRT_LUCI_PACKAGE=installed; else OPENWRT_LUCI_PACKAGE=absent; fi
+    fi
+
+    OPENWRT_TAILSCALE_VERSION=absent
+    if bootstrap_command_exists tailscale; then
+        OPENWRT_TAILSCALE_VERSION=$(bootstrap_capture_first_line tailscale version)
+        [ -n "$OPENWRT_TAILSCALE_VERSION" ] || OPENWRT_TAILSCALE_VERSION=present-version-unknown
+    fi
+    OPENWRT_TAILSCALED_VERSION=absent
+    if bootstrap_command_exists tailscaled; then
+        OPENWRT_TAILSCALED_VERSION=$(bootstrap_capture_first_line tailscaled --version)
+        [ -n "$OPENWRT_TAILSCALED_VERSION" ] || OPENWRT_TAILSCALED_VERSION=present-version-unknown
+    fi
+
+    OPENWRT_BOARD_MODEL=unknown
+    OPENWRT_BOARD_RELEASE=unknown
+    if bootstrap_command_exists ubus; then
+        OPENWRT_BOARD_JSON=$(ubus call system board 2>/dev/null)
+        OPENWRT_BOARD_MODEL=$(printf '%s\n' "$OPENWRT_BOARD_JSON" | sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+        OPENWRT_BOARD_RELEASE=$(printf '%s\n' "$OPENWRT_BOARD_JSON" | sed -n 's/.*"release"[[:space:]]*:[[:space:]]*{.*/release-object/p' | sed -n '1p')
+    fi
+    [ -n "$OPENWRT_BOARD_MODEL" ] || OPENWRT_BOARD_MODEL=unknown
+    [ -n "$OPENWRT_BOARD_RELEASE" ] || OPENWRT_BOARD_RELEASE=unknown
+
+    OPENWRT_TUN_PRESENT=no
+    [ -c "$OPENWRT_TUN" ] && OPENWRT_TUN_PRESENT=yes
+    OPENWRT_FW4_PRESENT=no
+    OPENWRT_NFT_PRESENT=no
+    bootstrap_command_exists fw4 && OPENWRT_FW4_PRESENT=yes
+    bootstrap_command_exists nft && OPENWRT_NFT_PRESENT=yes
+
+    OPENWRT_IPV4_FORWARD=unknown
+    OPENWRT_IPV6_FORWARD=unknown
+    if [ -r "$OPENWRT_PROC_IPV4_FORWARD" ]; then OPENWRT_IPV4_FORWARD=$(bootstrap_read_first_line "$OPENWRT_PROC_IPV4_FORWARD"); fi
+    if [ -r "$OPENWRT_PROC_IPV6_FORWARD" ]; then OPENWRT_IPV6_FORWARD=$(bootstrap_read_first_line "$OPENWRT_PROC_IPV6_FORWARD"); fi
+    if bootstrap_command_exists sysctl && [ "$BOOTSTRAP_ROOT" = / ]; then
+        OPENWRT_IPV4_FORWARD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null | sed -n '1p')
+        OPENWRT_IPV6_FORWARD=$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null | sed -n '1p')
+    fi
+    [ -n "$OPENWRT_IPV4_FORWARD" ] || OPENWRT_IPV4_FORWARD=unknown
+    [ -n "$OPENWRT_IPV6_FORWARD" ] || OPENWRT_IPV6_FORWARD=unknown
+
+    OPENWRT_UNSAFE_MATCHES=
+    openwrt_scan_unsafe_file "$OPENWRT_INIT_TAILSCALE"
+    openwrt_scan_unsafe_file "$OPENWRT_HELPER"
+    openwrt_scan_unsafe_file "$OPENWRT_CONFIG_TAILSCALE"
+    if [ -n "$OPENWRT_UNSAFE_MATCHES" ]; then OPENWRT_UNSAFE_LUCI_HELPER=yes; else OPENWRT_UNSAFE_LUCI_HELPER=no; fi
+
+    OPENWRT_STOCK_SERVICE_ENABLED=unknown
+    OPENWRT_CORE_SERVICE_ENABLED=unknown
+    if [ -d "$OPENWRT_RC_DIR" ]; then
+        if find "$OPENWRT_RC_DIR" \( -type l -o -type f \) -print 2>/dev/null | grep -q '/S[0-9][0-9]tailscale$'; then
+            OPENWRT_STOCK_SERVICE_ENABLED=yes
+        else
+            OPENWRT_STOCK_SERVICE_ENABLED=no
+        fi
+        if find "$OPENWRT_RC_DIR" \( -type l -o -type f \) -print 2>/dev/null | grep -q '/S[0-9][0-9]tailscale-core$'; then
+            OPENWRT_CORE_SERVICE_ENABLED=yes
+        else
+            OPENWRT_CORE_SERVICE_ENABLED=no
+        fi
+    fi
+
+    OPENWRT_CONFIG_LOGIN_SERVER=
+    if [ "$OPENWRT_TAILSCALE_CONFIG_PRESENT" = yes ]; then
+        OPENWRT_CONFIG_LOGIN_SERVER=$(openwrt_uci_option_from_file "$OPENWRT_CONFIG_TAILSCALE" login_server)
+    fi
+    [ -n "$OPENWRT_LOGIN_SERVER" ] || OPENWRT_LOGIN_SERVER=$OPENWRT_CONFIG_LOGIN_SERVER
+
+    openwrt_parse_prefs
+    [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] || OPENWRT_CURRENT_CONTROL_URL=unknown
+
+    OPENWRT_CURRENT_NETWORK_CHANGES=unknown
+    OPENWRT_CURRENT_FIREWALL_CHANGES=unknown
+    if bootstrap_command_exists uci && [ "$BOOTSTRAP_ROOT" = / ]; then
+        OPENWRT_CURRENT_NETWORK_CHANGES=$(uci changes network 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        OPENWRT_CURRENT_FIREWALL_CHANGES=$(uci changes firewall 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        [ -n "$OPENWRT_CURRENT_NETWORK_CHANGES" ] || OPENWRT_CURRENT_NETWORK_CHANGES=clean
+        [ -n "$OPENWRT_CURRENT_FIREWALL_CHANGES" ] || OPENWRT_CURRENT_FIREWALL_CHANGES=clean
+    fi
+
+    OPENWRT_NETWORK_TS_PRESENT=no
+    OPENWRT_FIREWALL_TS_PRESENT=no
+    OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=no
+    OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=no
+    if [ "$BOOTSTRAP_ROOT" = / ] && bootstrap_command_exists uci; then
+        uci -q get network.tailscale >/dev/null 2>&1 && OPENWRT_NETWORK_TS_PRESENT=yes
+        uci -q get firewall.tailscale >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_PRESENT=yes
+        uci -q get firewall.ts_to_lan >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=yes
+        uci -q get firewall.ts_wan_udp >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=yes
+    else
+        openwrt_section_in_file "$OPENWRT_CONFIG_NETWORK" interface tailscale && OPENWRT_NETWORK_TS_PRESENT=yes
+        openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" zone tailscale && OPENWRT_FIREWALL_TS_PRESENT=yes
+        openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" forwarding ts_to_lan && OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=yes
+        openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" rule ts_wan_udp && OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=yes
+    fi
+
+    OPENWRT_TS0_PRESENT=no
+    OPENWRT_TS0_IP4=unknown
+    if bootstrap_command_exists ip; then
+        ip link show tailscale0 >/dev/null 2>&1 && OPENWRT_TS0_PRESENT=yes
+        OPENWRT_TS0_IP4=$(ip -4 -o addr show dev tailscale0 2>/dev/null | awk '{print $4}' | sed -n '1p')
+    fi
+    [ -e "$(openwrt_target_path /sys/class/net/tailscale0)" ] && OPENWRT_TS0_PRESENT=yes
+    [ -n "$OPENWRT_TS0_IP4" ] || OPENWRT_TS0_IP4=unknown
+
+    OPENWRT_FIREWALL_DEVICE=unknown
+    if [ "$OPENWRT_FW4_PRESENT" = yes ]; then
+        OPENWRT_FIREWALL_DEVICE=$(fw4 device tailscale0 2>/dev/null | sed -n '1p')
+        [ -n "$OPENWRT_FIREWALL_DEVICE" ] || OPENWRT_FIREWALL_DEVICE=none
+    fi
+
+    OPENWRT_LAN_ROUTE=unknown
+    if bootstrap_command_exists ip; then
+        OPENWRT_LAN_ROUTE=$(ip -4 route show scope link 2>/dev/null | awk '$1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// {print $1; exit}')
+    fi
+    [ -n "$OPENWRT_LAN_ROUTE" ] || OPENWRT_LAN_ROUTE=unknown
+
+    OPENWRT_TS_PORT=41641
+    if [ "$OPENWRT_TAILSCALE_CONFIG_PRESENT" = yes ]; then
+        OPENWRT_CONFIG_PORT=$(openwrt_uci_option_from_file "$OPENWRT_CONFIG_TAILSCALE" port)
+        [ -n "$OPENWRT_CONFIG_PORT" ] && OPENWRT_TS_PORT=$OPENWRT_CONFIG_PORT
+    fi
+    OPENWRT_SOCKETS=
+    if bootstrap_command_exists ss; then OPENWRT_SOCKETS=$(ss -lun 2>/dev/null); fi
+    OPENWRT_UDP_TS_PORT=$(openwrt_socket_state "$OPENWRT_TS_PORT" "$OPENWRT_SOCKETS")
+}
+
+openwrt_effective_values() {
+    OPENWRT_EFFECTIVE_LOGIN_SERVER=${OPENWRT_LOGIN_SERVER:-$OPENWRT_CURRENT_CONTROL_URL}
+    OPENWRT_EFFECTIVE_LOGIN_SERVER=$(bootstrap_normalize_url "$OPENWRT_EFFECTIVE_LOGIN_SERVER")
+    if [ "$OPENWRT_SERVICE_MODE" = auto ]; then
+        OPENWRT_EFFECTIVE_SERVICE_MODE=core
+    else
+        OPENWRT_EFFECTIVE_SERVICE_MODE=$OPENWRT_SERVICE_MODE
+    fi
+}
+
+openwrt_print_text_discover() {
+    printf 'OpenWrt Tailscale discovery (read-only)\n'
+    printf '  root: %s\n' "$BOOTSTRAP_ROOT"
+    printf '  board/model: %s\n' "$OPENWRT_BOARD_MODEL"
+    printf '  package manager/UCI: %s/%s\n' "$OPENWRT_PACKAGE_MANAGER" "$OPENWRT_UCI_PRESENT"
+    printf '  tailscale package/client/daemon: %s/%s/%s\n' "$OPENWRT_TAILSCALE_PACKAGE" "$OPENWRT_TAILSCALE_VERSION" "$OPENWRT_TAILSCALED_VERSION"
+    printf '  luci-app-tailscale: %s\n' "$OPENWRT_LUCI_PACKAGE"
+    printf '  TUN/fw4/nft: %s/%s/%s\n' "$OPENWRT_TUN_PRESENT" "$OPENWRT_FW4_PRESENT" "$OPENWRT_NFT_PRESENT"
+    printf '  IPv4/IPv6 forwarding: %s/%s\n' "$OPENWRT_IPV4_FORWARD" "$OPENWRT_IPV6_FORWARD"
+    printf '  state dir/state file: %s/%s\n' "$OPENWRT_TAILSCALE_DIR_PRESENT" "$OPENWRT_STATE_PRESENT"
+    printf '  tailscale-core present/enabled/fingerprint: %s/%s/%s; stock init present/enabled: %s/%s\n' "$OPENWRT_INIT_CORE_PRESENT" "$OPENWRT_CORE_SERVICE_ENABLED" "$OPENWRT_CORE_FINGERPRINT" "$OPENWRT_STOCK_INIT_PRESENT" "$OPENWRT_STOCK_SERVICE_ENABLED"
+    printf '  dangerous LuCI/helper fingerprint: %s (%s)\n' "$OPENWRT_UNSAFE_LUCI_HELPER" "${OPENWRT_UNSAFE_MATCHES# }"
+    printf '  current ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+    printf '  backend state/IP4: %s/%s\n' "$OPENWRT_TAILSCALE_STATE" "$OPENWRT_TAILSCALE_IP4"
+    printf '  prefs readable/profiles: %s/%s\n' "$OPENWRT_PREFS_READABLE" "$OPENWRT_PROFILE_STATE"
+    printf '  advertise routes: %s\n' "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+    printf '  exit-node risk: %s\n' "$OPENWRT_EXIT_NODE_RISK"
+    printf '  tailscale0 present/IP4: %s/%s\n' "$OPENWRT_TS0_PRESENT" "$OPENWRT_TS0_IP4"
+    printf '  fw4 device tailscale0: %s\n' "$OPENWRT_FIREWALL_DEVICE"
+    printf '  LAN route observed: %s\n' "$OPENWRT_LAN_ROUTE"
+    printf '  UCI network/firewall pending: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+    printf '  UCI sections network.tailscale/firewall.tailscale/ts_to_lan/ts_wan_udp: %s/%s/%s/%s\n' \
+        "$OPENWRT_NETWORK_TS_PRESENT" "$OPENWRT_FIREWALL_TS_PRESENT" "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
+    printf '  UDP %s: %s\n' "$OPENWRT_TS_PORT" "$OPENWRT_UDP_TS_PORT"
+}
+
+openwrt_print_json_discover() {
+    bootstrap_json_start
+    bootstrap_json_field script "$OPENWRT_PROGRAM"
+    bootstrap_json_field command discover
+    bootstrap_json_field root "$BOOTSTRAP_ROOT"
+    bootstrap_json_field board "$OPENWRT_BOARD_MODEL"
+    bootstrap_json_field package_manager "$OPENWRT_PACKAGE_MANAGER"
+    bootstrap_json_field uci "$OPENWRT_UCI_PRESENT"
+    bootstrap_json_field tailscale_package "$OPENWRT_TAILSCALE_PACKAGE"
+    bootstrap_json_field tailscale_version "$OPENWRT_TAILSCALE_VERSION"
+    bootstrap_json_field tailscaled_version "$OPENWRT_TAILSCALED_VERSION"
+    bootstrap_json_field luci_app_tailscale "$OPENWRT_LUCI_PACKAGE"
+    bootstrap_json_field tun "$OPENWRT_TUN_PRESENT"
+    bootstrap_json_field fw4 "$OPENWRT_FW4_PRESENT"
+    bootstrap_json_field nft "$OPENWRT_NFT_PRESENT"
+    bootstrap_json_field ipv4_forward "$OPENWRT_IPV4_FORWARD"
+    bootstrap_json_field ipv6_forward "$OPENWRT_IPV6_FORWARD"
+    bootstrap_json_field state_dir "$OPENWRT_TAILSCALE_DIR_PRESENT"
+    bootstrap_json_field state_file "$OPENWRT_STATE_PRESENT"
+    bootstrap_json_field core_service "$OPENWRT_INIT_CORE_PRESENT"
+    bootstrap_json_field core_service_enabled "$OPENWRT_CORE_SERVICE_ENABLED"
+    bootstrap_json_field core_fingerprint "$OPENWRT_CORE_FINGERPRINT"
+    bootstrap_json_field stock_service_enabled "$OPENWRT_STOCK_SERVICE_ENABLED"
+    bootstrap_json_field unsafe_luci_helper "$OPENWRT_UNSAFE_LUCI_HELPER"
+    bootstrap_json_field unsafe_matches "${OPENWRT_UNSAFE_MATCHES# }"
+    bootstrap_json_field control_url "$OPENWRT_CURRENT_CONTROL_URL"
+    bootstrap_json_field backend_state "$OPENWRT_TAILSCALE_STATE"
+    bootstrap_json_field tailscale_ip4 "$OPENWRT_TAILSCALE_IP4"
+    bootstrap_json_field prefs_readable "$OPENWRT_PREFS_READABLE"
+    bootstrap_json_field profiles "$OPENWRT_PROFILE_STATE"
+    bootstrap_json_field advertise_routes "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+    bootstrap_json_field exit_node_risk "$OPENWRT_EXIT_NODE_RISK"
+    bootstrap_json_field tailscale0 "$OPENWRT_TS0_PRESENT"
+    bootstrap_json_field tailscale0_ip4 "$OPENWRT_TS0_IP4"
+    bootstrap_json_field fw4_device "$OPENWRT_FIREWALL_DEVICE"
+    bootstrap_json_field lan_route "$OPENWRT_LAN_ROUTE"
+    bootstrap_json_field network_changes "$OPENWRT_CURRENT_NETWORK_CHANGES"
+    bootstrap_json_field firewall_changes "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+    bootstrap_json_field network_tailscale "$OPENWRT_NETWORK_TS_PRESENT"
+    bootstrap_json_field firewall_tailscale "$OPENWRT_FIREWALL_TS_PRESENT"
+    bootstrap_json_field firewall_ts_to_lan "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT"
+    bootstrap_json_field firewall_ts_wan_udp "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
+    bootstrap_json_field udp_port_state "$OPENWRT_UDP_TS_PORT"
+    bootstrap_json_end
+}
+
+openwrt_print_discover() {
+    openwrt_collect_facts
+    if [ "$BOOTSTRAP_JSON" = 1 ]; then openwrt_print_json_discover; else openwrt_print_text_discover; fi
+}
+
+openwrt_plan() {
+    openwrt_collect_facts
+    openwrt_effective_values
+    openwrt_plan_blocked=0
+    openwrt_block_reasons=
+
+    if [ -z "$OPENWRT_EFFECTIVE_LOGIN_SERVER" ] || [ "$OPENWRT_EFFECTIVE_LOGIN_SERVER" = unknown ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons missing-login-server"
+    elif ! bootstrap_is_https_url "$OPENWRT_EFFECTIVE_LOGIN_SERVER"; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons login-server-not-https"
+    fi
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ] && [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] && [ -n "$OPENWRT_LOGIN_SERVER" ] && [ "$OPENWRT_CURRENT_CONTROL_URL" != "$OPENWRT_LOGIN_SERVER" ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons different-existing-controlurl"
+    fi
+    if [ "$OPENWRT_TUN_PRESENT" != yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons tun-missing"
+    fi
+    if [ "$OPENWRT_EFFECTIVE_SERVICE_MODE" = core ] && { [ "$OPENWRT_FW4_PRESENT" != yes ] || [ "$OPENWRT_NFT_PRESENT" != yes ]; }; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons fw4-nftables-baseline-not-confirmed"
+    fi
+    if [ "$OPENWRT_SERVICE_MODE" = native ] && [ "$OPENWRT_UNSAFE_LUCI_HELPER" = yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons unsafe-native-luci-helper"
+    fi
+    if [ "$OPENWRT_SERVICE_MODE" = native ] && [ "$OPENWRT_STOCK_INIT_PRESENT" != yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons native-init-not-found"
+    fi
+    if [ "$OPENWRT_UCI_PRESENT" != yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons uci-not-found"
+    fi
+    if [ "$OPENWRT_EFFECTIVE_SERVICE_MODE" = core ] && [ "$OPENWRT_CORE_FINGERPRINT" = unverified ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons unverified-tailscale-core"
+    fi
+    if [ "$OPENWRT_NETWORK_TS_PRESENT" = yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons existing-network-tailscale-section"
+    fi
+    if [ "$OPENWRT_CURRENT_NETWORK_CHANGES" != clean ] && [ "$OPENWRT_CURRENT_NETWORK_CHANGES" != unknown ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons pending-network-uci-changes"
+    fi
+    if [ "$OPENWRT_CURRENT_FIREWALL_CHANGES" != clean ] && [ "$OPENWRT_CURRENT_FIREWALL_CHANGES" != unknown ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons pending-firewall-uci-changes"
+    fi
+    if [ "$OPENWRT_EXIT_NODE_RISK" = yes ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons exit-node-or-default-route-risk"
+    fi
+    if [ "$OPENWRT_ENABLE_SUBNET" = true ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons subnet-transaction-not-implemented-in-milestone-1"
+        [ -n "$OPENWRT_SUBNET" ] || {
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons subnet-not-specified"
+        }
+        case "$OPENWRT_SUBNET" in
+            100.64.*|fd7a:*)
+                openwrt_plan_blocked=1
+                openwrt_block_reasons="$openwrt_block_reasons subnet-overlaps-tailnet-range"
+                ;;
+        esac
+    fi
+    if [ "$OPENWRT_ALLOW_WAN_UDP" = true ]; then
+        openwrt_plan_blocked=1
+        openwrt_block_reasons="$openwrt_block_reasons wan-udp-transaction-not-implemented-in-milestone-1"
+    fi
+
+    if [ "$BOOTSTRAP_JSON" = 1 ]; then
+        bootstrap_json_start
+        bootstrap_json_field script "$OPENWRT_PROGRAM"
+        bootstrap_json_field command plan
+        bootstrap_json_field effective_service_mode "$OPENWRT_EFFECTIVE_SERVICE_MODE"
+        bootstrap_json_field login_server "${OPENWRT_EFFECTIVE_LOGIN_SERVER:-unknown}"
+        bootstrap_json_field current_control_url "$OPENWRT_CURRENT_CONTROL_URL"
+        bootstrap_json_field blocked_reasons "${openwrt_block_reasons# }"
+        if [ "$openwrt_plan_blocked" -eq 1 ]; then bootstrap_json_bool_field blocked true; else bootstrap_json_bool_field blocked false; fi
+        bootstrap_json_field mutates_system no
+        bootstrap_json_field network_reload no
+        bootstrap_json_field exit_node false
+        bootstrap_json_end
+    else
+        printf 'OpenWrt Tailscale plan (read-only; no changes made)\n'
+        printf 'Detected:\n'
+        printf '  service requested/effective: %s/%s\n' "$OPENWRT_SERVICE_MODE" "$OPENWRT_EFFECTIVE_SERVICE_MODE"
+        printf '  requested/current ControlURL: %s/%s\n' "${OPENWRT_EFFECTIVE_LOGIN_SERVER:-unknown}" "$OPENWRT_CURRENT_CONTROL_URL"
+        printf '  package/tun/fw4/nft: %s/%s/%s/%s\n' "$OPENWRT_TAILSCALE_PACKAGE" "$OPENWRT_TUN_PRESENT" "$OPENWRT_FW4_PRESENT" "$OPENWRT_NFT_PRESENT"
+        printf '  dangerous helper: %s (%s)\n' "$OPENWRT_UNSAFE_LUCI_HELPER" "${OPENWRT_UNSAFE_MATCHES# }"
+        printf '  existing network.tailscale: %s\n' "$OPENWRT_NETWORK_TS_PRESENT"
+        printf '  pending network/firewall UCI: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+        printf '  exit-node risk: %s; subnet requested: %s/%s; WAN UDP requested: %s\n' \
+            "$OPENWRT_EXIT_NODE_RISK" "$OPENWRT_ENABLE_SUBNET" "${OPENWRT_SUBNET:-none}" "$OPENWRT_ALLOW_WAN_UDP"
+        printf '\nWould change in a later Milestone (not now):\n'
+        if [ "$OPENWRT_TAILSCALE_PACKAGE" = absent ]; then
+            printf '  - install only the Tailscale package required by the selected package manager\n'
+        fi
+        if [ "$OPENWRT_EFFECTIVE_SERVICE_MODE" = core ]; then
+            printf '  - fingerprint the stock helper, disable it without stop if unsafe, and install tailscale-core\n'
+        else
+            printf '  - use native service only after the helper fingerprint is proven safe\n'
+        fi
+        printf '  - join with file: auth key, accept-dns=false, accept-routes=false, and no --reset\n'
+        printf '  - bind fw4 directly to device tailscale0 only after fw4 check; never create netifd tailscale interface\n'
+        if [ "$OPENWRT_ENABLE_SUBNET" = true ]; then
+            printf '  - advertise %s and add only IPv4 tailscale -> lan forwarding; approval remains a Headscale-side action\n' "$OPENWRT_SUBNET"
+        else
+            printf '  - leave subnet routing disabled until explicitly requested\n'
+        fi
+        if [ "$OPENWRT_ALLOW_WAN_UDP" = true ]; then
+            printf '  - add a narrow UDP %s WAN rule only after explicit request; provide a reversible remove path\n' "$OPENWRT_TS_PORT"
+        else
+            printf '  - leave WAN UDP %s closed by default and rely on DERP fallback\n' "$OPENWRT_TS_PORT"
+        fi
+        printf '\nWill NOT change in this milestone:\n'
+        printf '  - no tailscale up --reset, no stock init stop/reload/restart, no network reload, no UCI write/commit, no firewall reload\n'
+        printf '  - no exit node, no IPv6 subnet routing, no DNS changes, no identity purge, no silent ControlURL switch\n'
+        if [ "$openwrt_plan_blocked" -eq 1 ]; then
+            printf '\nBLOCKED: %s\n' "${openwrt_block_reasons# }"
+        else
+            printf '\nREADY FOR FUTURE MILESTONE: discovery did not find a hard conflict.\n'
+        fi
+    fi
+
+    if [ "$openwrt_plan_blocked" -eq 0 ]; then
+        return 0
+    fi
+    return 2
+}
+
+openwrt_status() {
+    openwrt_collect_facts
+    openwrt_effective_values
+    OPENWRT_STATUS_CODE=0
+    OPENWRT_STATUS_REASONS=
+    if [ "$OPENWRT_TAILSCALE_PACKAGE" != installed ] && [ "$OPENWRT_TAILSCALE_VERSION" = absent ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS tailscale-package-missing"
+    fi
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" = unknown ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS controlurl-unknown"
+    fi
+    if [ "$OPENWRT_TAILSCALE_STATE" = unknown ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS backend-state-unknown"
+    fi
+    if [ "$OPENWRT_TAILSCALE_STATE" != Running ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS backend-not-running"
+    fi
+    if [ "$OPENWRT_INIT_CORE_PRESENT" = yes ] && [ "$OPENWRT_CORE_FINGERPRINT" != verified ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS unverified-tailscale-core"
+    fi
+    if [ "$OPENWRT_CURRENT_NETWORK_CHANGES" != clean ] || [ "$OPENWRT_CURRENT_NETWORK_CHANGES" = unknown ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS network-uci-not-clean-or-unknown"
+    fi
+    if [ "$OPENWRT_CURRENT_FIREWALL_CHANGES" != clean ] || [ "$OPENWRT_CURRENT_FIREWALL_CHANGES" = unknown ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS firewall-uci-not-clean-or-unknown"
+    fi
+    if [ "$OPENWRT_TAILSCALE_STATE" = Running ] && [ "$OPENWRT_TS0_PRESENT" != yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS backend-running-without-tailscale0"
+    fi
+    if [ "$OPENWRT_TS0_PRESENT" = yes ] && [ "$OPENWRT_FIREWALL_DEVICE" != tailscale ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS tailscale0-not-bound-to-fw4-zone"
+    fi
+    if [ "$OPENWRT_CURRENT_ACCEPT_DNS" = true ] || [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS unsafe-dns-or-route-acceptance"
+    fi
+    if [ "$OPENWRT_UNSAFE_LUCI_HELPER" = yes ] && [ "$OPENWRT_STOCK_SERVICE_ENABLED" = yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS unsafe-stock-service-enabled"
+    fi
+    if [ "$OPENWRT_NETWORK_TS_PRESENT" = yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS network-tailscale-section-present"
+    fi
+    if [ "$OPENWRT_EXIT_NODE_RISK" = yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS exit-node-risk"
+    fi
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ] && [ -n "$OPENWRT_LOGIN_SERVER" ] && [ "$OPENWRT_CURRENT_CONTROL_URL" != "$OPENWRT_LOGIN_SERVER" ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS requested-controlurl-differs"
+    fi
+
+    if [ "$BOOTSTRAP_JSON" = 1 ]; then
+        bootstrap_json_start
+        bootstrap_json_field script "$OPENWRT_PROGRAM"
+        bootstrap_json_field command status
+        bootstrap_json_field backend_state "$OPENWRT_TAILSCALE_STATE"
+        bootstrap_json_field control_url "$OPENWRT_CURRENT_CONTROL_URL"
+        bootstrap_json_field tailscale_ip4 "$OPENWRT_TAILSCALE_IP4"
+        bootstrap_json_field tailscale0 "$OPENWRT_TS0_PRESENT"
+        bootstrap_json_field fw4_device "$OPENWRT_FIREWALL_DEVICE"
+        bootstrap_json_field core_service "$OPENWRT_INIT_CORE_PRESENT"
+        bootstrap_json_field network_changes "$OPENWRT_CURRENT_NETWORK_CHANGES"
+        bootstrap_json_field firewall_changes "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+        bootstrap_json_field reasons "${OPENWRT_STATUS_REASONS# }"
+        if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then bootstrap_json_bool_field ok true; else bootstrap_json_bool_field ok false; fi
+        bootstrap_json_end
+    else
+        printf 'OpenWrt Tailscale status (read-only)\n'
+        printf '  backend state: %s\n' "$OPENWRT_TAILSCALE_STATE"
+        printf '  ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+        printf '  Tailscale IPv4/tailscale0: %s/%s\n' "$OPENWRT_TAILSCALE_IP4" "$OPENWRT_TS0_PRESENT"
+        printf '  fw4 device tailscale0: %s\n' "$OPENWRT_FIREWALL_DEVICE"
+        printf '  tailscale-core present: %s\n' "$OPENWRT_INIT_CORE_PRESENT"
+        printf '  stock init enabled: %s; unsafe helper: %s\n' "$OPENWRT_STOCK_SERVICE_ENABLED" "$OPENWRT_UNSAFE_LUCI_HELPER"
+        printf '  network/firewall UCI pending: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+        printf '  exit-node risk: %s\n' "$OPENWRT_EXIT_NODE_RISK"
+        if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then printf 'OK\n'; else printf 'FAIL: %s\n' "${OPENWRT_STATUS_REASONS# }"; fi
+    fi
+
+    return "$OPENWRT_STATUS_CODE"
+}
+
+openwrt_backup_packages() {
+    openwrt_backup_package_file=$1
+    if [ "$OPENWRT_PACKAGE_MANAGER" = opkg ]; then
+        opkg list-installed 2>/dev/null | awk '$1 ~ /^(tailscale|luci-app-tailscale)$/ {print}' > "$openwrt_backup_package_file"
+    elif [ "$OPENWRT_PACKAGE_MANAGER" = apk ]; then
+        apk info 2>/dev/null | grep -E '^(tailscale|luci-app-tailscale)' > "$openwrt_backup_package_file"
+    else
+        printf 'package-manager=unavailable\n' > "$openwrt_backup_package_file"
+    fi
+    chmod 600 "$openwrt_backup_package_file" 2>/dev/null || true
+}
+
+openwrt_backup_prefs() {
+    openwrt_backup_prefs_file=$1
+    if bootstrap_command_exists tailscale; then
+        tailscale debug prefs > "$openwrt_backup_prefs_file" 2>/dev/null || printf 'prefs=unavailable\n' > "$openwrt_backup_prefs_file"
+    else
+        printf 'tailscale=unavailable\n' > "$openwrt_backup_prefs_file"
+    fi
+    chmod 600 "$openwrt_backup_prefs_file" 2>/dev/null || true
+}
+
+openwrt_backup() {
+    openwrt_collect_facts
+    bootstrap_sha256_available || die 'backup requires sha256sum, shasum, or openssl'
+    if [ "$BOOTSTRAP_ROOT" = / ] && [ "$(id -u 2>/dev/null || printf 1)" != 0 ]; then
+        die 'backup of the real OpenWrt device requires root; use --root DIR only for an explicit fixture'
+    fi
+
+    OPENWRT_BACKUP_BASE=$(bootstrap_root_path "$OPENWRT_BACKUP_DIR")
+    OPENWRT_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
+    OPENWRT_BACKUP_ROOT=$(backup_allocate_directory "$OPENWRT_BACKUP_BASE" "$OPENWRT_BACKUP_TIMESTAMP") || die "cannot allocate backup directory below: $OPENWRT_BACKUP_BASE"
+    OPENWRT_BACKUP_ID=${OPENWRT_BACKUP_ROOT##*/}
+    chmod 700 "$OPENWRT_BACKUP_ROOT" 2>/dev/null || true
+    backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+
+    backup_copy_path "$OPENWRT_ETC_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/tailscale" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy /etc/tailscale; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_INIT_CORE" "$OPENWRT_BACKUP_ROOT/source/etc/init.d/tailscale-core" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy tailscale-core; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_INIT_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/init.d/tailscale" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy stock tailscale init; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_HELPER" "$OPENWRT_BACKUP_ROOT/source/usr/sbin/tailscale_helper" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy tailscale helper; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_CONFIG_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/config/tailscale" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy /etc/config/tailscale; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_CONFIG_FIREWALL" "$OPENWRT_BACKUP_ROOT/source/etc/config/firewall" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy /etc/config/firewall; incomplete backup retained'
+    }
+    backup_copy_path "$OPENWRT_CONFIG_NETWORK" "$OPENWRT_BACKUP_ROOT/source/etc/config/network" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to copy /etc/config/network; incomplete backup retained'
+    }
+
+    mkdir -p "$OPENWRT_BACKUP_ROOT/diagnostics" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to create diagnostics directory; incomplete backup retained'
+    }
+    openwrt_backup_prefs "$OPENWRT_BACKUP_ROOT/diagnostics/prefs.txt"
+    openwrt_backup_packages "$OPENWRT_BACKUP_ROOT/diagnostics/packages.txt"
+    {
+        printf 'control_url=%s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+        printf 'tailscale_ip4=%s\n' "$OPENWRT_TAILSCALE_IP4"
+        printf 'advertise_routes=%s\n' "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+        printf 'unsafe_helper=%s\n' "$OPENWRT_UNSAFE_LUCI_HELPER"
+        printf 'unsafe_matches=%s\n' "${OPENWRT_UNSAFE_MATCHES# }"
+        printf 'state_file_present=%s\n' "$OPENWRT_STATE_PRESENT"
+    } > "$OPENWRT_BACKUP_ROOT/diagnostics/summary.txt"
+    chmod 600 "$OPENWRT_BACKUP_ROOT/diagnostics/summary.txt" 2>/dev/null || true
+
+    backup_finish "$OPENWRT_BACKUP_ROOT" "$OPENWRT_PROGRAM" "$BOOTSTRAP_ROOT" "$OPENWRT_BACKUP_TIMESTAMP" || {
+        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+        die 'failed to finalize backup manifest; incomplete backup retained'
+    }
+
+    if [ "$BOOTSTRAP_JSON" = 1 ]; then
+        bootstrap_json_start
+        bootstrap_json_field script "$OPENWRT_PROGRAM"
+        bootstrap_json_field command backup
+        bootstrap_json_field backup_id "$OPENWRT_BACKUP_ID"
+        bootstrap_json_field backup_path "$OPENWRT_BACKUP_ROOT"
+        bootstrap_json_field manifest manifest.sha256
+        bootstrap_json_field secret_contents not-logged
+        bootstrap_json_end
+    else
+        printf 'Backup created: %s\n' "$OPENWRT_BACKUP_ROOT"
+        printf 'Manifest: %s\n' "$OPENWRT_BACKUP_ROOT/manifest.sha256"
+        printf 'tailscaled.state was handled as private backup data and was not printed.\n'
+    fi
+}
+
+openwrt_reserved_command() {
+    log_error "$OPENWRT_COMMAND is reserved for a later Milestone and is fail-closed in this build"
+    log_error 'No tailscale up, init stop/reload/restart, network reload, UCI, firewall, package, or identity change was attempted'
+    exit 2
+}
+
+openwrt_main() {
+    openwrt_parse_args "$@"
+    case "$OPENWRT_COMMAND" in
+        discover) openwrt_print_discover ;;
+        plan) openwrt_plan ;;
+        status|verify) openwrt_status ;;
+        backup) openwrt_backup ;;
+        *) openwrt_reserved_command ;;
+    esac
+}
+
+openwrt_main "$@"

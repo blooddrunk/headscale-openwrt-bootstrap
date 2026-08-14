@@ -1,0 +1,6 @@
+#!/bin/sh
+case "$*" in
+    *'addr show scope global'*) printf '2: eth0    inet 203.0.113.10/24 scope global eth0\n' ;;
+    *) : ;;
+esac
+

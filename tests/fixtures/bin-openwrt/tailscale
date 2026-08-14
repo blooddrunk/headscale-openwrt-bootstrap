@@ -1,0 +1,14 @@
+#!/bin/sh
+case "$1" in
+    version) printf '1.98.3\n' ;;
+    debug)
+        printf '{"ControlURL":"https://hs.example.com","CorpDNS":false,"RouteAll":false,"AdvertiseRoutes":["192.168.10.0/24"]}\n'
+        ;;
+    status)
+        printf '{"BackendState":"Running"}\n'
+        ;;
+    ip) printf '100.64.0.1\n' ;;
+    switch) printf 'profile-home\n' ;;
+    *) exit 0 ;;
+esac
+

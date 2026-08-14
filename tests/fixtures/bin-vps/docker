@@ -1,0 +1,11 @@
+#!/bin/sh
+case "$1" in
+    ps) printf '1Panel-openresty\n' ;;
+    inspect)
+        case "$*" in
+            *Mounts*) printf '/opt/1panel/www=>/www;/opt/1panel/www/conf.d=>/usr/local/openresty/nginx/conf/conf.d;\n' ;;
+            *) printf '/1Panel-openresty|openresty:latest|host\n' ;;
+        esac
+        ;;
+    *) exit 1 ;;
+esac
