@@ -511,7 +511,7 @@ openwrt_watchdog_fingerprint() {
         printf 'absent\n'
         return 0
     fi
-    if grep -qF 'TS_FAILOVER_WATCHDOG_v1' "$openwrt_wd_file" 2>/dev/null \
+    if grep -qF 'TS_FAILOVER_WATCHDOG_v2' "$openwrt_wd_file" 2>/dev/null \
         && grep -qF 'failover_probe' "$openwrt_wd_file" 2>/dev/null \
         && grep -qF 'tailscale switch' "$openwrt_wd_file" 2>/dev/null \
         && ! grep -qF 'tailscale up' "$openwrt_wd_file" 2>/dev/null \

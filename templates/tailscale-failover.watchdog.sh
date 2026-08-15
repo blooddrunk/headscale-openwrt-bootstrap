@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# TS_FAILOVER_WATCHDOG_v1
+# TS_FAILOVER_WATCHDOG_v2
 #
 # Deployed by headscale-openwrt-bootstrap as /usr/sbin/tailscale-failover.
 # The bootstrap script fingerprint-checks this file before every start;
@@ -167,9 +167,14 @@ failover_switch() {
     failover_sw_url=$4
 
     failover_sw_ok=0
-    if tailscale switch "$failover_sw_profile" >/dev/null 2>&1; then
+    # The real CLI has no --id flag: the positional argument matches ID,
+    # then tailnet, then account name, first match wins.  One account name
+    # can be registered on several servers, and a name match may land on
+    # the already-current profile (a successful no-op), so prefer the
+    # unambiguous ID and keep the name only as a fallback.
+    if [ -n "$failover_sw_id" ] && tailscale switch "$failover_sw_id" >/dev/null 2>&1; then
         failover_sw_ok=1
-    elif [ -n "$failover_sw_id" ] && tailscale switch --id="$failover_sw_id" >/dev/null 2>&1; then
+    elif [ -n "$failover_sw_profile" ] && tailscale switch "$failover_sw_profile" >/dev/null 2>&1; then
         failover_sw_ok=1
     fi
     if [ "$failover_sw_ok" != 1 ]; then

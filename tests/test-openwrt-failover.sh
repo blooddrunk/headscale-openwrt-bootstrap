@@ -204,6 +204,45 @@ assert_contains "$OUT" 'different control server'
 rm -f "$KEYFILE"
 
 ################################################################
+# C2. duplicate account names: profiles must be keyed by ID
+################################################################
+
+# The real CLI prints a padded "ID Tailnet Account" table that reflows
+# when a wider profile joins, and one account name can be registered on
+# several servers.  profile-add must still record the real entry (not the
+# re-padded header), and switch-to must land on the requested server even
+# though both profiles share the account name.
+make_fresh_root owf-dupname
+reset_bootcfg
+run_ow --login-server "$A" install >/dev/null
+
+new_key dup-a
+export FAKE_TS_LOGIN_NAME=home
+run_ow --login-server "$A" --auth-key-file "$KEYFILE" profile-add >/dev/null
+assert_file_contains "$BOOTCFG" "option ts_profile 'home'"
+assert_file_contains "$BOOTCFG" "option ts_id '0101'"
+
+new_key dup-b
+run_ow --login-server "$B" --auth-key-file "$KEYFILE" profile-add >/dev/null
+unset FAKE_TS_LOGIN_NAME
+assert_file_contains "$BOOTCFG" "option login_server '$B'"
+assert_file_contains "$BOOTCFG" "option ts_profile 'home'"
+assert_file_contains "$BOOTCFG" "option ts_id '0102'"
+assert_file_not_contains "$BOOTCFG" "ts_profile 'Account'"
+assert_file_not_contains "$BOOTCFG" "ts_id 'ID'"
+[ "$(cur_url)" = "$A" ] || fail "adding a same-name backup must not yank the active network: $(cur_url)"
+
+OUT=$(run_ow --login-server "$B" switch-to)
+assert_contains "$OUT" "Switched to: $B"
+[ "$(cur_url)" = "$B" ] || fail "switch-to must key on the profile ID, not the shared name: $(cur_url)"
+
+run_ow --login-server "$A" switch-to >/dev/null
+[ "$(cur_url)" = "$A" ] || fail "switch back to A failed: $(cur_url)"
+
+ROOT=$TMP_DIR/owf-a
+reset_bootcfg
+
+################################################################
 # D. enable-failover: gating, deployment, idempotency
 ################################################################
 
@@ -323,7 +362,7 @@ assert_contains "$OUT" 'failover-watchdog-missing-or-unverified'
 
 log_reset
 run_ow --login-server "$A" enable-failover >/dev/null
-assert_file_contains "$ROOT/usr/sbin/tailscale-failover" 'TS_FAILOVER_WATCHDOG_v1'
+assert_file_contains "$ROOT/usr/sbin/tailscale-failover" 'TS_FAILOVER_WATCHDOG_v2'
 TAMPERED_BACKUP=$(grep -rl '# tampered by hand' "$ROOT"/root/tailscale-bootstrap-backups/*/source/usr/sbin/tailscale-failover 2>/dev/null | sed -n '1p')
 [ -n "$TAMPERED_BACKUP" ] || fail 'tampered watchdog must be backed up before repair'
 run_ow --login-server "$A" status >/dev/null

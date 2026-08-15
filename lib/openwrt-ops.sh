@@ -831,6 +831,8 @@ openwrt_ts_entry_fields() {
             sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
             n = split(line, f, /[[:space:]]+/)
             if (n == 0 || line == "") exit
+            # "ID ... Account" is the table header, never a profile.
+            if (f[1] == "ID" && f[n] == "Account") exit
             print f[n] "|" ((n >= 3) ? f[1] : "")
         }'
 }
@@ -839,12 +841,19 @@ openwrt_ts_new_entry() {
     # openwrt_ts_new_entry BEFORE AFTER -> the first line only in AFTER.
     # Lines are normalized first: the only difference between "current" and
     # "not current" is a trailing asterisk, which must not look like a new
-    # profile.
-    openwrt_tne_before=$(printf '%s\n' "$1" | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//' | awk 'NF')
+    # profile.  The table's column padding also changes whenever a wider
+    # profile joins, so runs of blanks are squeezed before comparing, and
+    # the header row is skipped: an exact-text diff would otherwise mistake
+    # the re-padded "ID Tailnet Account" header for the new entry.
+    openwrt_tne_before=$(printf '%s\n' "$1" \
+        | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]\{1,\}/ /g' \
+        | awk 'NF')
     while IFS= read -r openwrt_tne_line; do
         [ -n "$openwrt_tne_line" ] || continue
-        openwrt_tne_line=$(printf '%s\n' "$openwrt_tne_line" | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//')
+        openwrt_tne_line=$(printf '%s\n' "$openwrt_tne_line" \
+            | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]\{1,\}/ /g')
         [ -n "$openwrt_tne_line" ] || continue
+        [ "$openwrt_tne_line" = 'ID Tailnet Account' ] && continue
         if ! printf '%s\n' "$openwrt_tne_before" | grep -qxF -- "$openwrt_tne_line"; then
             printf '%s\n' "$openwrt_tne_line"
             return 0
@@ -885,12 +894,22 @@ openwrt_ts_entries_strict_for_url() {
 
 openwrt_ts_switch() {
     # openwrt_ts_switch NAME ID; settles so the new ControlURL is observable.
+    # The real CLI has no --id flag: the positional argument is matched
+    # against ID, then tailnet, then account name, first match wins.  One
+    # account name can be registered on several servers, and a name match
+    # may land on the profile that is already current (a successful no-op),
+    # so switch by the unambiguous ID whenever one is recorded and keep the
+    # name only as a fallback.
     openwrt_tsw_name=$1
     openwrt_tsw_id=$2
-    if ! tailscale switch "$openwrt_tsw_name" >/dev/null 2>&1; then
-        [ -n "$openwrt_tsw_id" ] || return 1
-        tailscale switch --id="$openwrt_tsw_id" >/dev/null 2>&1 || return 1
+    openwrt_tsw_ok=
+    if [ -n "$openwrt_tsw_id" ]; then
+        tailscale switch "$openwrt_tsw_id" >/dev/null 2>&1 && openwrt_tsw_ok=1
     fi
+    if [ -z "$openwrt_tsw_ok" ] && [ -n "$openwrt_tsw_name" ]; then
+        tailscale switch "$openwrt_tsw_name" >/dev/null 2>&1 && openwrt_tsw_ok=1
+    fi
+    [ -n "$openwrt_tsw_ok" ] || return 1
     openwrt_tsw_settle=${OPENWRT_SWITCH_SETTLE:-5}
     [ "$openwrt_tsw_settle" -gt 0 ] 2>/dev/null && sleep "$openwrt_tsw_settle"
     return 0
@@ -1108,6 +1127,11 @@ openwrt_profile_add() {
     openwrt_pa_fields=$(openwrt_ts_entry_fields "$openwrt_pa_entry")
     openwrt_pa_name=${openwrt_pa_fields%%|*}
     openwrt_pa_id=${openwrt_pa_fields#*|}
+    [ -n "$openwrt_pa_name" ] || {
+        log_error "could not parse the tailscale profile entry: $openwrt_pa_entry"
+        log_warn 'if this followed a login, the node is now registered on the new network; fix the profile list manually or purge-identity'
+        exit 1
+    }
 
     openwrt_pa_section=$(openwrt_profile_section_name "$openwrt_pa_target")
     if [ -n "$OPENWRT_PRIORITY" ]; then
@@ -1175,7 +1199,8 @@ openwrt_switch_to() {
 
     openwrt_st_name=$(openwrt_profiles_get_field "$openwrt_st_target" 4)
     openwrt_st_id=$(openwrt_profiles_get_field "$openwrt_st_target" 5)
-    [ -n "$openwrt_st_name" ] || die "profile entry for $openwrt_st_target lacks ts_profile; re-add it via profile-add"
+    [ -n "$openwrt_st_name" ] || [ -n "$openwrt_st_id" ] || \
+        die "profile entry for $openwrt_st_target lacks ts_profile/ts_id; re-add it via profile-add"
 
     openwrt_ensure_daemon_running
     openwrt_ts_switch "$openwrt_st_name" "$openwrt_st_id" || die "tailscale switch to $openwrt_st_name failed"

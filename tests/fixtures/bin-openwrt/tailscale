@@ -109,29 +109,37 @@ case "$1 $2" in
         ;;
     'switch --list'|'switch --list '*)
         # Newer CLI table: "ID Tailnet Account" with the current account
-        # marked by a trailing asterisk.
+        # marked by a trailing asterisk.  Columns are padded like the real
+        # CLI, so every row (including the header) is re-padded whenever a
+        # wider profile joins the list.
         [ -f "$PROFILES" ] || exit 0
         cur=$(prefs_get ControlURL)
         awk -F'|' -v cur="$cur" '
-            { star = ($4 == cur) ? "*" : ""; printf "%s %s %s%s\n", $1, $2, $3, star }
+            {
+                id[++NDX] = $1; tn[NDX] = $2; ac[NDX] = $3
+                star[NDX] = ($4 == cur) ? "*" : ""
+                if (length($1) > wid) wid = length($1)
+                if (length($2) > wtn) wtn = length($2)
+                if (length($3) > wac) wac = length($3)
+            }
+            END {
+                if (NDX == 0) exit
+                printf "%-*s  %-*s  %s\n", wid, "ID", wtn, "Tailnet", "Account"
+                for (i = 1; i <= NDX; i++)
+                    printf "%-*s  %-*s  %s%s\n", wid, id[i], wtn, tn[i], ac[i], star[i]
+            }
         ' "$PROFILES"
         ;;
-    'switch --id='*|'switch --id '*)
-        sw_id=${2#--id=}
-        [ -n "$sw_id" ] || sw_id=$3
-        logged_in || exit 1
-        [ "${FAKE_FAIL_TS_SWITCH:-0}" = 1 ] && { printf 'switch failed (injected)\n' >&2; exit 1; }
-        new_url=$(awk -F'|' -v i="$sw_id" '$1 == i { print $4; exit }' "$PROFILES")
-        [ -n "$new_url" ] || { printf 'no profile with id %s\n' "$sw_id" >&2; exit 1; }
-        write_prefs "$new_url" "$(prefs_get CorpDNS)" "$(prefs_get RouteAll)" \
-            "$(sed -n 's/.*"AdvertiseRoutes":\[\([^]]*\)\].*/\1/p' "$PREFS")"
-        printf 'switched\n'
-        ;;
     'switch '*)
+        # Positional argument like the real CLI: matched against ID, then
+        # tailnet, then account name; the first hit wins.  There is no
+        # --id flag, and matching the current profile is a successful no-op.
         logged_in || exit 1
         [ "${FAKE_FAIL_TS_SWITCH:-0}" = 1 ] && { printf 'switch failed (injected)\n' >&2; exit 1; }
-        new_url=$(awk -F'|' -v n="$2" '$3 == n { print $4; exit }' "$PROFILES")
-        [ -n "$new_url" ] || { printf 'no profile named %s\n' "$2" >&2; exit 1; }
+        new_url=$(awk -F'|' -v k="$2" '$1 == k { print $4; exit }' "$PROFILES")
+        [ -n "$new_url" ] || new_url=$(awk -F'|' -v k="$2" '$2 == k { print $4; exit }' "$PROFILES")
+        [ -n "$new_url" ] || new_url=$(awk -F'|' -v k="$2" '$3 == k { print $4; exit }' "$PROFILES")
+        [ -n "$new_url" ] || { printf 'no profile matching %s\n' "$2" >&2; exit 1; }
         write_prefs "$new_url" "$(prefs_get CorpDNS)" "$(prefs_get RouteAll)" \
             "$(sed -n 's/.*"AdvertiseRoutes":\[\([^]]*\)\].*/\1/p' "$PREFS")"
         printf 'switched\n'
