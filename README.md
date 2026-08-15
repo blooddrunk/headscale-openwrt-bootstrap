@@ -78,7 +78,8 @@ scp -r headscale-openwrt-bootstrap root@192.168.1.1:/root/
 ssh root@192.168.1.1
 cd /root/headscale-openwrt-bootstrap
 
-# 1. 只读体检：包、危险 helper、TUN、fw4、当前 ControlURL 等
+# 1. 只读体检：包、危险 helper、TUN、fw4、当前 ControlURL、
+#    profile 列表与 failover 状态等
 ./tailscale-openwrt.sh --login-server https://hs.example.com discover
 ./tailscale-openwrt.sh --login-server https://hs.example.com plan
 
@@ -108,8 +109,9 @@ printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
     --login-server https://hs.example.com --auth-key-stdin join
 ```
 
-`profile-add` 同样支持这两种输入方式；已注册到目标网络、无需重新登录时，
-脚本不会读取 stdin。
+`profile-add` 同样支持这两种输入方式，且必须给出其中一种——即使节点
+已注册到目标网络、无需重新登录（收编场景不读取 stdin），flag 本身
+也不能省。
 
 `enable-subnet` 会自动从 `ubus` 读取 LAN 地址并正确计算网络 CIDR（例如
 192.168.10.129/25 → 192.168.10.128/25），随后停在"已广告、等待批准"
@@ -128,11 +130,14 @@ sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 同一时刻只有一个活动 tailnet），只是把"已注册的多个网络"登记在路由器
 上，由 watchdog 在当前网络失效时自动切换：
 
-profile 列表是项目自有的 `/etc/config/tailscale-bootstrap`，与
-`/etc/tailscale/tailscaled.state` 中的 Tailscale 身份分开保存。首次执行
-`profile-add` 时，如果这个 UCI 文件不存在，脚本会自动创建；如果节点
-此前已经通过 `join` 注册到目标网络，仍需显式执行一次 `profile-add` 才会
-把现有注册登记进列表：
+profile 列表保存在项目自有的 `/etc/config/tailscale-bootstrap`，与
+`/etc/tailscale/tailscaled.state` 中的 Tailscale 身份分开保存。每个网络
+一个 `config profile` 段（段名由 URL 主机名派生），记录 `login_server`、
+`priority`（数字越小越优先）以及对应的 tailscale 客户端 profile
+（`ts_profile`/`ts_id`，切换时按名字或 id 调 `tailscale switch`）。
+首次执行 `profile-add` 时，如果这个 UCI 文件不存在，脚本会自动创建；
+如果节点此前已经通过 `join` 注册到目标网络，仍需显式执行一次
+`profile-add` 才会把现有注册收编进列表：
 
 ```sh
 # 已通过 join 注册到当前网络时，不会重新登录，也不会读取 stdin
@@ -155,12 +160,28 @@ profile 列表是项目自有的 `/etc/config/tailscale-bootstrap`，与
 ./tailscale-openwrt.sh --login-server https://hs-b.example.com switch-to
 
 # 4. 启用自动故障切换
-./tailscale-openwrt.sh enable-failover            # 可选调参见 --help
+./tailscale-openwrt.sh enable-failover            # 可调参数见 --help
 ./tailscale-openwrt.sh status                     # 含 failover 健康项
 
 # 5. 随时把某个网络从列表移除（加 --delete-identity 会同时注销该身份）
 ./tailscale-openwrt.sh --login-server https://hs-b.example.com profile-remove
 ```
+
+`profile-remove` 自带保护：`--delete-identity` 在只剩最后一个 profile
+时拒绝执行（注销后没有可落地的网络）；同一 URL 反复 login 产生的多个
+tailscale profile 会被逐一 logout（最多 5 轮）；注销完成后自动切回
+仍登记的上一个网络。不带 `--delete-identity` 移除"当前活动网络"时只
+警告——节点仍注册在该网络，直到你 `switch-to` 别处。移除后列表剩不到
+2 个网络时，failover 守护会自动停用。
+
+`enable-failover` 的前置条件：至少 2 个已登记 profile，且路由器上有
+可用的 HTTPS 探测工具（curl/wget/uclient-fetch）。启用前会实测每个网络
+的 `--health-path`，全部不可达时拒绝启用一个"盲切"的 watchdog；当前
+不可达的网络会被列出，并在连续 `recovery_threshold` 次探测正常后才会
+重新成为切换候选。调参取值优先级：显式 flag > 已写入 UCI 的旧值 >
+默认值（`check_interval` 60 秒且下限 10、`failure_threshold`/
+`recovery_threshold` 各 3、`cooldown` 300 秒、`probe_timeout` 5 秒、
+`health_path` /health）。
 
 watchdog（`/usr/sbin/tailscale-failover`，procd 守护 `tailscale-failover`）
 的行为边界：
@@ -169,17 +190,27 @@ watchdog（`/usr/sbin/tailscale-failover`，procd 守护 `tailscale-failover`）
   （curl → wget → uclient-fetch，需要可用 CA 证书）；
 - 活动网络连续 `failure_threshold` 次探测失败（或控制面可达但
   BackendState ≠ Running，例如节点被服务端吊销）即切换到优先级最高
-  （数字最小）且连续 `recovery_threshold` 次探测正常的候选；
+  （数字最小）且连续 `recovery_threshold` 次探测正常的候选；近期切换
+  失败达 3 次的候选会被暂停（成功一次即归零）；
 - `--failback true` 才会回切更高优先级网络，默认保持稳定；
 - `cooldown` 秒内不发生第二次切换，切换后立即收敛安全偏好
   （accept-dns=false / accept-routes=false）；
 - 手动切到列表之外的网络时，只要它健康 watchdog 就不干预；失效才接管；
+- 运行状态（探测计数、最近切换时间、每次决策结果）在
+  `/var/run/tailscale-failover`（tmpfs，重启清零，短阈值下无妨）；
+  手动跑单个决策周期用 `/usr/sbin/tailscale-failover --once`，日志用
+  `logread | grep tailscale-failover`；
 - 它只调用 `tailscale switch`，从不 login、从不使用 auth key、
   从不改 netifd/fw4；配置与身份分离：列表在
   `/etc/config/tailscale-bootstrap`（项目自有文件），身份仍在
   `/etc/tailscale/tailscaled.state`；
 - 守护文件带指纹校验，被篡改后 plan/status 会阻断，
   `enable-failover` 自动备份并从模板修复。
+
+与备份/回退/清理的关系：`backup` 快照包含 profile 登记表与 watchdog
+文件，`rollback` 按快照整体恢复（仅当快照里 failover 已启用且剩余
+≥2 个 profile 时才重新启用守护）；`cleanup` 会移除 watchdog 与登记表，
+但 `tailscaled.state` 里的全部身份（所有网络的注册）都保留。
 
 注意事项：每个网络都需要一个你能访问的对端节点（手机/电脑同时加入
 两个 tailnet，或两个网络各有一个 exit node），否则切换后依旧没有入口。
@@ -198,20 +229,21 @@ subnet router 需在新服务器重新批准。
 | `install`                                         | 双端    | 全新安装（VPS：.deb；OpenWrt：opkg/apk 包 + tailscale-core）                                |
 | `apply`                                           | 双端    | 幂等收敛：已满足的状态不会重做、不会无谓重启                                                |
 | `join`                                            | OpenWrt | 用 `file:` auth key（`--auth-key-file` 或 `--auth-key-stdin`）注册，拒绝静默切换 ControlURL |
-| `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 定优先级，`--delete-identity` 同时注销身份）           |
+| `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 数字越小越优先，`--delete-identity` 同时注销身份）  |
 | `switch-to`                                       | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验）                                            |
-| `enable-failover` / `disable-failover`            | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog                                         |
+| `enable-failover` / `disable-failover`            | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog（需 ≥2 个 profile，启用前实测各网络 /health） |
 | `enable-subnet` / `disable-subnet`                | OpenWrt | 广播/撤回 LAN 网段，附 fw4 forwarding 事务                                                  |
 | `allow-wan-udp [false]`                           | OpenWrt | 添加/移除最窄的 WAN UDP 41641 入站规则                                                      |
 | `update`                                          | 双端    | 升级（VPS 遵守 minor 顺序；OpenWrt 只重启 tailscale-core 并校验身份不变）                   |
-| `rollback [BACKUP_ID]`                            | 双端    | 把配置+数据+（VPS）软件包作为一个快照整体恢复                                               |
-| `cleanup`                                         | 双端    | 删除脚本自管的内容，保留数据/身份/软件包                                                    |
+| `rollback [BACKUP_ID]`                            | 双端    | 把配置+数据+（VPS）软件包、（OpenWrt）profile 登记表与 watchdog 作为一个快照整体恢复        |
+| `cleanup`                                         | 双端    | 删除脚本自管的内容（OpenWrt 含 failover 守护与 profile 登记表），保留数据/身份/软件包       |
 | `purge` / `purge-identity`                        | 双端    | 破坏性操作，必须 `--yes-i-understand`，执行前做最终备份                                     |
 | `ensure-user` / `issue-key` / `approve-route`     | VPS     | 用户与注册密钥管理、路由批准                                                                |
 
 常用参数：VPS 侧 `--domain`、`--expected-public-ip`、`--proxy`、
-`--listen/--metrics-listen/--grpc-listen`、`--version`、`--user`、
-`--expiration`、`--output`、`--node-id`、`--route`；OpenWrt 侧
+`--listen/--metrics-listen/--grpc-listen`、`--version`（跨 minor 的
+`update` 还需 `--yes` 确认）、`--user`、`--expiration`、`--output`、
+`--node-id`、`--route`；OpenWrt 侧
 `--login-server`、`--auth-key-file`、`--auth-key-stdin`、`--service-mode`、`--accept-dns`、
 `--accept-routes`、`--subnet`、`--min-client-version`、`--priority`、
 `--delete-identity`，以及 enable-failover 的
