@@ -281,16 +281,46 @@ openwrt_ensure_core() {
     return 0
 }
 
+openwrt_daemon_supervised_by_core() {
+    # procd is the authority on which init script supervises the running
+    # tailscaled.  The fingerprinted tailscale-core template spawns exactly
+    # one /usr/sbin/tailscaled instance, so a live pid for that instance
+    # means the daemon belongs to this project's service.
+    bootstrap_command_exists ubus || return 1
+    openwrt_svc_json=$(ubus call service list '{"name":"tailscale-core","verbose":true}' 2>/dev/null) || return 1
+    [ -n "$openwrt_svc_json" ] || return 1
+    openwrt_svc_pid=
+    if bootstrap_command_exists jsonfilter; then
+        openwrt_svc_pid=$(printf '%s\n' "$openwrt_svc_json" | jsonfilter -e '@.tailscale-core.instances.main.pid' 2>/dev/null | sed -n '1p')
+    fi
+    if [ -z "$openwrt_svc_pid" ]; then
+        # Fallback without jsonfilter: real ubus pretty-prints across lines,
+        # so compact first; the reply covers only the requested service.
+        openwrt_svc_pid=$(printf '%s\n' "$openwrt_svc_json" | tr -d '\n\t\r ' | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    fi
+    [ -n "$openwrt_svc_pid" ]
+}
+
 openwrt_ensure_daemon_running() {
-    if [ "$BOOTSTRAP_ROOT" = / ]; then
-        if pgrep tailscaled >/dev/null 2>&1; then
-            openwrt_state_file=$(state_path_openwrt)
-            if [ -r "$openwrt_state_file" ] && [ "$(state_read_field "$openwrt_state_file" service_mode)" = core ]; then
-                log_info 'tailscaled already running under tailscale-core management'
-                return 0
-            fi
-            die 'tailscaled is already running but not recorded as managed by tailscale-core; stop it manually or reboot (this script never calls the third-party init)'
+    # Fixture tests resolve pgrep to the fixture binary, which answers from
+    # FAKE_TAILSCALED_RUNNING so the already-running paths stay testable.
+    if pgrep tailscaled >/dev/null 2>&1; then
+        openwrt_state_file=$(state_path_openwrt)
+        if [ -r "$openwrt_state_file" ] && [ "$(state_read_field "$openwrt_state_file" service_mode)" = core ]; then
+            log_info 'tailscaled already running under tailscale-core management'
+            return 0
         fi
+        if openwrt_daemon_supervised_by_core; then
+            # A previous run started tailscale-core but aborted before
+            # state.json was written.  Reboot would not clear this (the
+            # enabled service starts the daemon again), so adopt the
+            # daemon; the state write at the end of install records it.
+            log_warn 'tailscaled runs under tailscale-core but state.json does not record it (previous run aborted early); adopting it'
+            return 0
+        fi
+        die 'tailscaled is already running outside tailscale-core management; stop it manually or reboot (this script never calls the third-party init)'
+    fi
+    if [ "$BOOTSTRAP_ROOT" = / ]; then
         openwrt_init_action tailscale-core start || die 'failed to start tailscale-core'
         log_change 'started tailscale-core'
     else

@@ -123,6 +123,33 @@ assert_contains "$OUT" 'Install complete'
 log_not_has 'opkg install tailscale' || fail 'package must not be reinstalled'
 
 ################################################################
+# A2. install recovery: tailscaled already running under tailscale-core
+#     but state.json missing (a previous run aborted between daemon
+#     start and the state write)
+################################################################
+
+make_fresh_root ow-a2
+run_ow --login-server "$LOGIN" install >/dev/null
+rm -f "$ROOT/etc/tailscale-bootstrap/state.json"
+OUT=$(FAKE_TAILSCALED_RUNNING=1 FAKE_UBUS_CORE_PID=4242 run_ow --login-server "$LOGIN" install 2>&1)
+assert_contains "$OUT" 'adopting it'
+assert_contains "$OUT" 'Install complete'
+[ -f "$ROOT/etc/tailscale-bootstrap/state.json" ] || fail 'state.json not rewritten after adoption'
+assert_file_contains "$ROOT/etc/tailscale-bootstrap/state.json" '"service_mode": "core"'
+
+# A3. a tailscaled that procd does NOT attribute to tailscale-core (e.g.
+# started through the stock init) must still abort install.
+make_fresh_root ow-a3
+run_ow --login-server "$LOGIN" install >/dev/null
+rm -f "$ROOT/etc/tailscale-bootstrap/state.json"
+set +e
+OUT=$(FAKE_TAILSCALED_RUNNING=1 run_ow --login-server "$LOGIN" install 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'foreign tailscaled must abort install'
+assert_contains "$OUT" 'outside tailscale-core management'
+
+################################################################
 # B. apply: first-stage fw4 zone transaction, then idempotent
 ################################################################
 

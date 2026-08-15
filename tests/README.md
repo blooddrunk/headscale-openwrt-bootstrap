@@ -32,7 +32,11 @@ probe failures for the failover watchdog), `FAKE_MISMATCH_DEB=1`,
 `FAKE_LOCAL_HEALTH=503`, `FAKE_RELEASE_TAGS="..."`,
 `FAKE_HEALTH_DELAY=N` (the first N local /health probes answer 000,
 emulating a headscale still initializing; the fixture `sleep` is a
-no-op, so polling retry windows cost no test time).
+no-op, so polling retry windows cost no test time),
+`FAKE_TAILSCALED_RUNNING=1` (fixture `pgrep` reports a live tailscaled)
+and `FAKE_UBUS_CORE_PID=N` (fixture `ubus` reports tailscale-core
+supervising a daemon with that pid; unset means no running instance)
+together drive the install-recovery paths in `openwrt_ensure_daemon_running`.
 
 The fake `tailscale` keeps a profile database (`$FAKE_OPENWRT_ROOT/.ts-state/
 profiles`, one `id|tailnet|name|controlurl` line each) and emulates
