@@ -133,9 +133,15 @@ OUT=$(vps issue-key --user home)
 KEY=$(printf '%s\n' "$OUT" | grep -F 'hskey-auth' | sed -n '1p')
 [ -n "$KEY" ] || fail 'issue-key did not emit a key'
 [ "$(printf '%s\n' "$OUT" | grep -cF "$KEY")" = 1 ] || fail 'key must appear exactly once (stdout only)'
+if printf '%s' "$KEY" | LC_ALL=C grep -q "$(printf '\033')"; then
+    fail 'issued key must not contain ANSI escape sequences'
+fi
 KEYFILE=$TMP_DIR/key.out
 OUT=$(vps issue-key --user home --expiration 4h --output "$KEYFILE")
 assert_file_contains "$KEYFILE" 'hskey-auth-'
+if LC_ALL=C grep -q "$(printf '\033')" "$KEYFILE"; then
+    fail 'key file must not contain ANSI escape sequences'
+fi
 [ "$(stat -c '%a' "$KEYFILE")" = 600 ] || fail 'key file must be 0600'
 assert_not_contains "$OUT" 'hskey-auth-' || true
 

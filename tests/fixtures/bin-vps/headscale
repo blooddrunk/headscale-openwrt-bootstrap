@@ -66,14 +66,19 @@ case "$cmd" in
                 # Headscale >= 0.26 table: "Name" is the display name (empty
                 # for plain `users create`), the username lives in "Username".
                 # --name filters server-side on the username; releases without
-                # the flag are emulated via FAKE_NO_NAME_FILTER=1.
+                # the flag are emulated via FAKE_NO_NAME_FILTER=1.  pterm
+                # colors the table even when captured (observed on a real
+                # 0.29 VPS), so rows carry ANSI sequences the script must
+                # strip; the ID cell reproduces the exact bytes seen there.
                 if [ -n "$name_filter" ] && [ "${FAKE_NO_NAME_FILTER:-0}" = 1 ]; then
                     printf 'Error: unknown flag: --name\n' >&2
                     exit 1
                 fi
-                printf 'ID | Name | Username | Email | Created\n'
+                printf '\033[96mID\033[0m | \033[96mName\033[0m | \033[96mUsername\033[0m | \033[96mEmail\033[0m | \033[96mCreated\033[0m\n'
                 if [ -f "$STATE/users" ]; then
-                    awk -F'|' -v f="${name_filter:-}" 'f == "" || $3 == f {printf "%s | %s | %s | %s | 2026-01-01\n", $1, $2, $3, $4}' "$STATE/users"
+                    awk -F'|' -v f="${name_filter:-}" 'f == "" || $3 == f {
+                        printf "\033[96m\033[0m\033[0m%s\033[90m\033[90m | \033[96m%s\033[0m | \033[96m%s\033[0m | \033[96m%s\033[0m | 2026-01-01\n", $1, $2, $3, $4
+                    }' "$STATE/users"
                 fi
                 ;;
             create)
@@ -96,7 +101,7 @@ case "$cmd" in
                 [ -n "$user_id" ] || { printf 'preauthkeys create needs --user\n' >&2; exit 1; }
                 key="hskey-auth-FIXTURE${user_id}-$(date +%s 2>/dev/null || printf 12345)"
                 printf '%s\n' "$key" >> "$STATE/preauthkeys"
-                printf '%s\n' "$key"
+                printf '\033[96m%s\033[0m\n' "$key"
                 ;;
             list) printf 'ID | Key | Reusable | Expiration | Created | Expires\n' ;;
             *) exit 1 ;;

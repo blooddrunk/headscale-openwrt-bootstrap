@@ -607,18 +607,28 @@ vps_user_id_for() {
     '
 }
 
+vps_strip_ansi() {
+    # Headscale renders CLI output through pterm, which colors it with ANSI
+    # SGR/CSI sequences even when stdout is captured (observed on 0.29:
+    # the users-table ID cell arrives as ESC[96m ESC[0m ESC[0m 1 ESC[90m
+    # ESC[90m).  Strip every CSI sequence before parsing captured output.
+    sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g"
+}
+
 vps_resolve_user_id() {
     # vps_resolve_user_id NAME -> prints the user id, exits nonzero if absent.
     # Primary lookup: server-side `users list --name NAME` (Headscale >= 0.26)
-    # so existence means "the table has a data row" and column 1 is the id;
-    # no table-column parsing is involved.  Only sed/cut/tr touch the output.
-    # Headscale without the flag (older releases) falls back to parsing the
-    # unfiltered table via vps_user_id_for.
-    vps_rui_filtered=$(headscale users list --name "$1" 2>/dev/null) || {
-        vps_rui_all=$(headscale users list 2>/dev/null) || return 1
-        vps_user_id_for "$vps_rui_all" "$1" && return 0
+    # so existence means "the filtered table has a data row" and column 1 is
+    # the id; no table-column parsing is involved.  Only sed/cut/tr touch the
+    # output, after vps_strip_ansi removes pterm coloring.  Releases without
+    # the flag (older Headscale) fall back to parsing the unfiltered table
+    # via vps_user_id_for.
+    vps_rui_raw=$(NO_COLOR=1 headscale users list --name "$1" 2>/dev/null) || {
+        vps_rui_all=$(NO_COLOR=1 headscale users list 2>/dev/null) || return 1
+        vps_user_id_for "$(printf '%s\n' "$vps_rui_all" | vps_strip_ansi)" "$1" && return 0
         return 1
     }
+    vps_rui_filtered=$(printf '%s\n' "$vps_rui_raw" | vps_strip_ansi)
     vps_rui_row=$(printf '%s\n' "$vps_rui_filtered" | sed -n '2p')
     [ -n "$vps_rui_row" ] || return 1
     vps_rui_id=$(printf '%s\n' "$vps_rui_row" | cut -d'|' -f1 | tr -d ' \t')
@@ -649,9 +659,10 @@ vps_issue_key() {
         vps_user_id=$(vps_resolve_user_id "$VPS_USER_NAME") || die 'cannot resolve user id after create'
         log_change "created Headscale user $VPS_USER_NAME (id $vps_user_id)"
     fi
-    vps_key=$(headscale preauthkeys create --user "$vps_user_id" --expiration "${VPS_KEY_EXPIRATION:-2h}") || {
+    vps_key_raw=$(NO_COLOR=1 headscale preauthkeys create --user "$vps_user_id" --expiration "${VPS_KEY_EXPIRATION:-2h}") || {
         die 'preauthkeys create failed (check headscale version flag support with: headscale preauthkeys create --help)'
     }
+    vps_key=$(printf '%s\n' "$vps_key_raw" | vps_strip_ansi)
     log_change "issued pre-auth key $(printf '%s\n' "$vps_key" | sed -n 's/^\(hskey-..............\).*/\1/p')-***"
     if [ -n "$VPS_KEY_OUTPUT" ]; then
         umask 077
