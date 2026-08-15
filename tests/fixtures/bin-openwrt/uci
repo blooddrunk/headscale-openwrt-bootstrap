@@ -102,6 +102,10 @@ cmd_get() {
 cmd_set() {
     set_path=$1
     set_value=$(unquote "$2")
+    # Real UCI requires the package file to exist before `uci set` can stage
+    # a section or option.  Keep the fixture honest so profile initialization
+    # is covered instead of being created implicitly by commit below.
+    [ -f "$(config_file "$set_path")" ] || die_missing
     mkdir -p "$DELTA_DIR"
     case "$set_path" in
         *.*.*) printf 'set-option|%s|%s\n' "$set_path" "$set_value" >> "$(delta_file "$set_path")" ;;

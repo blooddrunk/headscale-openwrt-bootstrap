@@ -128,6 +128,18 @@ sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 同一时刻只有一个活动 tailnet），只是把"已注册的多个网络"登记在路由器
 上，由 watchdog 在当前网络失效时自动切换：
 
+profile 列表是项目自有的 `/etc/config/tailscale-bootstrap`，与
+`/etc/tailscale/tailscaled.state` 中的 Tailscale 身份分开保存。首次执行
+`profile-add` 时，如果这个 UCI 文件不存在，脚本会自动创建；如果节点
+此前已经通过 `join` 注册到目标网络，仍需显式执行一次 `profile-add` 才会
+把现有注册登记进列表：
+
+~~~sh
+# 已通过 join 注册到当前网络时，不会重新登录，也不会读取 stdin
+./tailscale-openwrt.sh --login-server https://hs-a.example.com \
+    --auth-key-stdin --priority 10 profile-add
+~~~
+
 ~~~sh
 # 1. 登记第一个网络（未注册时也可直接用 profile-add 代替 join）
 ./tailscale-openwrt.sh --login-server https://hs-a.example.com \

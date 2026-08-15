@@ -84,6 +84,26 @@ openwrt_init_action() {
 
 # --- UCI transaction helpers ----------------------------------------------
 
+openwrt_ensure_bootstrap_config() {
+    # The real UCI CLI requires a package file to exist before `uci set`
+    # stages a section.  Profile management owns this file, so create only
+    # the missing empty file and never replace an administrator's config.
+    [ -n "${OPENWRT_CONFIG_BOOTSTRAP:-}" ] || die 'bootstrap UCI config path is not initialized'
+    if [ -e "$OPENWRT_CONFIG_BOOTSTRAP" ]; then
+        [ -f "$OPENWRT_CONFIG_BOOTSTRAP" ] || \
+            die "bootstrap UCI config is not a regular file: $OPENWRT_CONFIG_BOOTSTRAP"
+        return 0
+    fi
+
+    openwrt_bootstrap_config_dir=$(dirname "$OPENWRT_CONFIG_BOOTSTRAP")
+    [ -d "$openwrt_bootstrap_config_dir" ] || \
+        mkdir -p "$openwrt_bootstrap_config_dir" || \
+        die "cannot create UCI config directory: $openwrt_bootstrap_config_dir"
+    : > "$OPENWRT_CONFIG_BOOTSTRAP" || \
+        die "cannot create bootstrap UCI config: $OPENWRT_CONFIG_BOOTSTRAP"
+    log_change "created project-owned UCI config: $OPENWRT_CONFIG_BOOTSTRAP"
+}
+
 openwrt_uci_ensure_section() {
     # openwrt_uci_ensure_section PATH TYPE; returns 0 when staged, 1 no-op.
     if openwrt_current=$(uci -q get "$1" 2>/dev/null); then
@@ -1067,6 +1087,7 @@ openwrt_profile_add() {
         [ "$openwrt_pa_priority" -ge 10 ] || openwrt_pa_priority=10
     fi
 
+    openwrt_ensure_bootstrap_config
     openwrt_uci_ensure_section "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section" profile || true
     uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.login_server=$openwrt_pa_target" || die 'uci set login_server failed'
     uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.priority=$openwrt_pa_priority" || die 'uci set priority failed'
