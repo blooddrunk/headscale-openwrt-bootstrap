@@ -4,7 +4,11 @@
 # that keep netifd, fw4, tailscaled and the LuCI helper from fighting:
 #   - netifd never manages tailscale0 (no network.tailscale, no network reload);
 #   - the dangerous stock /etc/init.d/tailscale is only ever disabled, never
-#     stopped/reloaded/restarted;
+#     stopped/reloaded/restarted -- the one exception is
+#     openwrt_takeover_stock_daemon: when procd proves the running tailscaled
+#     belongs to the stock service that the package postinst autostarted, the
+#     procd service is deleted through ubus (a stop without ever executing the
+#     third-party script);
 #   - firewall writes go: pending UCI -> fw4 check -> commit -> firewall reload;
 #   - the daemon runs through tailscale-core only; identity lives in
 #     /etc/tailscale/tailscaled.state and is never printed.
@@ -229,6 +233,7 @@ openwrt_firewall_ensure_wan_udp_rule() {
 # --- core service / daemon ------------------------------------------------
 
 openwrt_ensure_core() {
+    OPENWRT_PACKAGE_JUST_INSTALLED=no
     if [ "$OPENWRT_TAILSCALE_PACKAGE" != installed ]; then
         [ "$OPENWRT_PACKAGE_MANAGER" != none ] || die 'no supported package manager (opkg/apk) found'
         case "$OPENWRT_PACKAGE_MANAGER" in
@@ -237,6 +242,10 @@ openwrt_ensure_core() {
         esac
         openwrt_refresh
         [ "$OPENWRT_TAILSCALE_PACKAGE" = installed ] || die 'tailscale package still not installed'
+        # OpenWrt's default_postinst enables and starts every shipped init
+        # script, so the package install autostarts a stock-supervised
+        # tailscaled; openwrt_takeover_stock_daemon keys off this flag.
+        OPENWRT_PACKAGE_JUST_INSTALLED=yes
         log_change 'installed the tailscale package'
     fi
 
@@ -281,6 +290,21 @@ openwrt_ensure_core() {
     return 0
 }
 
+openwrt_ubus_reply_pid() {
+    # openwrt_ubus_reply_pid JSON [jsonfilter-expression]; prints the pid or
+    # nothing.  Real ubus pretty-prints across lines, so the fallback compacts
+    # first; a reply filtered by service name covers that service only.
+    openwrt_pid_json=$1
+    openwrt_pid_out=
+    if [ -n "$2" ] && bootstrap_command_exists jsonfilter; then
+        openwrt_pid_out=$(printf '%s\n' "$openwrt_pid_json" | jsonfilter -e "$2" 2>/dev/null | sed -n '1p')
+    fi
+    if [ -z "$openwrt_pid_out" ]; then
+        openwrt_pid_out=$(printf '%s\n' "$openwrt_pid_json" | tr -d '\n\t\r ' | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    fi
+    printf '%s\n' "$openwrt_pid_out"
+}
+
 openwrt_daemon_supervised_by_core() {
     # procd is the authority on which init script supervises the running
     # tailscaled.  The fingerprinted tailscale-core template spawns exactly
@@ -289,16 +313,51 @@ openwrt_daemon_supervised_by_core() {
     bootstrap_command_exists ubus || return 1
     openwrt_svc_json=$(ubus call service list '{"name":"tailscale-core","verbose":true}' 2>/dev/null) || return 1
     [ -n "$openwrt_svc_json" ] || return 1
-    openwrt_svc_pid=
-    if bootstrap_command_exists jsonfilter; then
-        openwrt_svc_pid=$(printf '%s\n' "$openwrt_svc_json" | jsonfilter -e '@.tailscale-core.instances.main.pid' 2>/dev/null | sed -n '1p')
-    fi
-    if [ -z "$openwrt_svc_pid" ]; then
-        # Fallback without jsonfilter: real ubus pretty-prints across lines,
-        # so compact first; the reply covers only the requested service.
-        openwrt_svc_pid=$(printf '%s\n' "$openwrt_svc_json" | tr -d '\n\t\r ' | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
-    fi
+    openwrt_svc_pid=$(openwrt_ubus_reply_pid "$openwrt_svc_json" '@.tailscale-core.instances.main.pid')
     [ -n "$openwrt_svc_pid" ]
+}
+
+openwrt_stock_daemon_pid() {
+    # pid procd attributes to the stock "tailscale" service, if any; the
+    # stock init leaves its instance unnamed, so parse the first pid without
+    # a jsonfilter path.
+    bootstrap_command_exists ubus || return 1
+    openwrt_stock_json=$(ubus call service list '{"name":"tailscale","verbose":true}' 2>/dev/null) || return 1
+    [ -n "$openwrt_stock_json" ] || return 1
+    openwrt_stock_pid=$(openwrt_ubus_reply_pid "$openwrt_stock_json")
+    [ -n "$openwrt_stock_pid" ] || return 1
+    printf '%s\n' "$openwrt_stock_pid"
+}
+
+openwrt_takeover_stock_daemon() {
+    # opkg's default_postinst starts every shipped init script, so installing
+    # the tailscale package leaves a stock-supervised, respawning tailscaled
+    # that would fight tailscale-core for port 41641 and the state file.
+    # When procd proves the running daemon belongs to the stock service,
+    # remove that service through procd itself (never by executing the
+    # third-party script).  Gate: this run installed the package, or no
+    # install ever completed (no state.json) -- i.e. the daemon is autostart
+    # residue, not an administrator's deliberately started service.
+    openwrt_stock_pid=$(openwrt_stock_daemon_pid) || return 1
+    if [ "$OPENWRT_PACKAGE_JUST_INSTALLED" != yes ] && [ -r "$(state_path_openwrt)" ]; then
+        return 1
+    fi
+    log_warn "tailscaled (pid $openwrt_stock_pid) runs under the stock 'tailscale' service (package postinst autostart); removing the stock procd service so tailscale-core can own the daemon"
+    ubus call service delete '{"name":"tailscale"}' >/dev/null 2>&1 || {
+        log_error 'failed to remove the stock tailscale service from procd'
+        return 1
+    }
+    openwrt_stop_wait=0
+    while pgrep tailscaled >/dev/null 2>&1 && [ "$openwrt_stop_wait" -lt 10 ]; do
+        sleep 1
+        openwrt_stop_wait=$((openwrt_stop_wait + 1))
+    done
+    pgrep tailscaled >/dev/null 2>&1 && {
+        log_error 'the stock tailscaled did not exit after the procd service removal; stop it manually and re-run'
+        return 1
+    }
+    log_change 'stock tailscaled stopped via procd service delete; tailscale-core takes over'
+    return 0
 }
 
 openwrt_ensure_daemon_running() {
@@ -318,7 +377,9 @@ openwrt_ensure_daemon_running() {
             log_warn 'tailscaled runs under tailscale-core but state.json does not record it (previous run aborted early); adopting it'
             return 0
         fi
-        die 'tailscaled is already running outside tailscale-core management; stop it manually or reboot (this script never calls the third-party init)'
+        openwrt_takeover_stock_daemon || \
+            die 'tailscaled is already running outside tailscale-core management; stop it manually or reboot (this script never calls the third-party init)'
+        # stock daemon stopped above; fall through and start tailscale-core
     fi
     if [ "$BOOTSTRAP_ROOT" = / ]; then
         openwrt_init_action tailscale-core start || die 'failed to start tailscale-core'

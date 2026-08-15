@@ -22,5 +22,20 @@ case "$*" in
             printf '{\n\t"tailscale-core": {\n\t\t"instances": {}\n\t}\n}\n'
         fi
         ;;
+    'call service list'*tailscale*)
+        # Stock package service (autostarted by default_postinst); its init
+        # leaves the instance unnamed, so procd reports the default name.
+        if [ -n "${FAKE_UBUS_STOCK_PID:-}" ]; then
+            printf '{\n\t"tailscale": {\n\t\t"instances": {\n\t\t\t"instance1": {\n\t\t\t\t"running": true,\n\t\t\t\t"pid": %s\n\t\t\t}\n\t\t}\n\t}\n}\n' "$FAKE_UBUS_STOCK_PID"
+        else
+            printf '{\n\t"tailscale": {\n\t\t"instances": {}\n\t}\n}\n'
+        fi
+        ;;
+    'call service delete'*tailscale*)
+        # Emulate procd: deleting the service terminates its instance, which
+        # the fixture pgrep observes through the marker file.
+        mkdir -p "${FAKE_OPENWRT_ROOT:-/nonexistent}" 2>/dev/null
+        [ -n "${FAKE_OPENWRT_ROOT:-}" ] && : > "$FAKE_OPENWRT_ROOT/.stock-daemon-stopped"
+        ;;
     *) exit 0 ;;
 esac

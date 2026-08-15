@@ -149,6 +149,45 @@ set -e
 [ "$CODE" -ne 0 ] || fail 'foreign tailscaled must abort install'
 assert_contains "$OUT" 'outside tailscale-core management'
 
+# A4. fresh box: the package postinst (default_postinst) enables+starts the
+#     stock service, so install sees a stock-supervised tailscaled right
+#     after installing the package; install must take it over via procd.
+make_fresh_root ow-a4
+OUT=$(FAKE_TAILSCALED_RUNNING=1 FAKE_UBUS_STOCK_PID=777 run_ow --login-server "$LOGIN" install 2>&1)
+assert_contains "$OUT" "removing the stock procd service"
+assert_contains "$OUT" 'Install complete'
+log_has 'ubus call service list' || fail 'must query procd for service ownership'
+log_has 'ubus call service delete' || fail 'must delete the stock service through procd'
+log_not_has 'init tailscale stop' || fail 'the stock init script must never be executed'
+log_has 'init tailscale-core start' || fail 'tailscale-core must be started after the takeover'
+[ -f "$ROOT/.stock-daemon-stopped" ] || fail 'fixture procd did not record the service deletion'
+[ -f "$ROOT/etc/tailscale-bootstrap/state.json" ] || fail 'state.json missing after takeover install'
+
+# A5. package pre-installed by an earlier aborted run (state.json missing,
+#     stock daemon still running): the takeover gate still applies.
+make_fresh_root ow-a5
+run_ow --login-server "$LOGIN" install >/dev/null
+rm -f "$ROOT/etc/tailscale-bootstrap/state.json"
+OUT=$(FAKE_TAILSCALED_RUNNING=1 FAKE_UBUS_STOCK_PID=778 run_ow --login-server "$LOGIN" install 2>&1)
+assert_contains "$OUT" 'Install complete'
+[ -f "$ROOT/etc/tailscale-bootstrap/state.json" ] || fail 'state.json not rewritten after takeover'
+
+# A6. a pre-existing state.json that does not record core (abandoned box)
+#     plus a running stock daemon: not autostart residue of this run, so
+#     install must abort without touching the stock service.
+make_fresh_root ow-a6
+run_ow --login-server "$LOGIN" install >/dev/null
+sed 's/"service_mode": "core"/"service_mode": "stock"/' \
+    "$ROOT/etc/tailscale-bootstrap/state.json" > "$ROOT/etc/tailscale-bootstrap/state.json.tmp"
+mv "$ROOT/etc/tailscale-bootstrap/state.json.tmp" "$ROOT/etc/tailscale-bootstrap/state.json"
+set +e
+OUT=$(FAKE_TAILSCALED_RUNNING=1 FAKE_UBUS_STOCK_PID=779 run_ow --login-server "$LOGIN" install 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'a stock daemon on a non-core state box must abort install'
+assert_contains "$OUT" 'outside tailscale-core management'
+[ ! -f "$ROOT/.stock-daemon-stopped" ] || fail 'must not delete the stock service when gated out'
+
 ################################################################
 # B. apply: first-stage fw4 zone transaction, then idempotent
 ################################################################
