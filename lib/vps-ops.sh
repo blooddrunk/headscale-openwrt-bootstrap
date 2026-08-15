@@ -585,19 +585,19 @@ vps_apply_nginx() {
 
 vps_user_id_for() {
     # vps_user_id_for USERS_LIST NAME -> prints the id, exits nonzero if absent.
-    # `headscale users list` renders a pipe-separated table; fields carry
-    # padding.  Since Headscale 0.26 the "Name" column holds the display name
-    # (empty for plain `users create`) and the username lives in "Username";
-    # older releases kept the username in "Name".  Locate the column from the
-    # header so both layouts match, or creating an existing user fails with a
-    # UNIQUE constraint on users.name.
+    # Fallback lookup: `headscale users list` renders a pipe-separated table;
+    # fields carry padding.  Since Headscale 0.26 the "Name" column holds the
+    # display name (empty for plain `users create`) and the username lives in
+    # "Username"; older releases kept the username in "Name".  Locate the
+    # column from the header so both layouts match.  Keep to plain POSIX awk
+    # constructs only.  The primary lookup is vps_resolve_user_id.
     printf '%s\n' "$1" | awk -F'|' -v wanted="$2" '
-        function field(n, s) { s = $n; gsub(/[[:space:]]/, "", s); return s }
+        function field(n, s) { s = $n; gsub(/[ \t]/, "", s); return s }
         NR == 1 {
             for (i = 1; i <= NF; i++) {
-                col = tolower(field(i))
-                if (col == "username") name_col = i
-                else if (col == "name" && name_col == 0) name_col = i
+                col = field(i)
+                if (col == "Username") name_col = i
+                else if (col == "Name" && name_col == 0) name_col = i
             }
             if (name_col == 0) name_col = 2
             next
@@ -607,18 +607,35 @@ vps_user_id_for() {
     '
 }
 
+vps_resolve_user_id() {
+    # vps_resolve_user_id NAME -> prints the user id, exits nonzero if absent.
+    # Primary lookup: server-side `users list --name NAME` (Headscale >= 0.26)
+    # so existence means "the table has a data row" and column 1 is the id;
+    # no table-column parsing is involved.  Only sed/cut/tr touch the output.
+    # Headscale without the flag (older releases) falls back to parsing the
+    # unfiltered table via vps_user_id_for.
+    vps_rui_filtered=$(headscale users list --name "$1" 2>/dev/null) || {
+        vps_rui_all=$(headscale users list 2>/dev/null) || return 1
+        vps_user_id_for "$vps_rui_all" "$1" && return 0
+        return 1
+    }
+    vps_rui_row=$(printf '%s\n' "$vps_rui_filtered" | sed -n '2p')
+    [ -n "$vps_rui_row" ] || return 1
+    vps_rui_id=$(printf '%s\n' "$vps_rui_row" | cut -d'|' -f1 | tr -d ' \t')
+    [ -n "$vps_rui_id" ] || return 1
+    printf '%s\n' "$vps_rui_id"
+}
+
 vps_ensure_user() {
     [ -n "$VPS_USER_NAME" ] || die 'ensure-user requires --user NAME'
     vps_refresh
     [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed'
-    vps_user_list=$(headscale users list 2>/dev/null) || die 'headscale users list failed'
-    if vps_user_id=$(vps_user_id_for "$vps_user_list" "$VPS_USER_NAME"); then
+    if vps_user_id=$(vps_resolve_user_id "$VPS_USER_NAME"); then
         printf 'User %s already exists (id %s).\n' "$VPS_USER_NAME" "$vps_user_id"
         return 0
     fi
-    headscale users create "$VPS_USER_NAME" || die "failed to create user $VPS_USER_NAME"
-    vps_user_list=$(headscale users list 2>/dev/null) || die 'headscale users list failed after create'
-    vps_user_id=$(vps_user_id_for "$vps_user_list" "$VPS_USER_NAME") || die 'created user not found in users list'
+    headscale users create "$VPS_USER_NAME" || die "failed to create user $VPS_USER_NAME (the name may already exist while 'headscale users list' cannot be parsed on this system; run it manually and report the exact output)"
+    vps_user_id=$(vps_resolve_user_id "$VPS_USER_NAME") || die 'created user not found after create'
     log_change "created Headscale user $VPS_USER_NAME (id $vps_user_id)"
     printf 'User %s created (id %s).\n' "$VPS_USER_NAME" "$vps_user_id"
 }
@@ -627,11 +644,9 @@ vps_issue_key() {
     [ -n "$VPS_USER_NAME" ] || die 'issue-key requires --user NAME'
     vps_refresh
     [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed'
-    vps_user_list=$(headscale users list 2>/dev/null) || die 'headscale users list failed'
-    if ! vps_user_id=$(vps_user_id_for "$vps_user_list" "$VPS_USER_NAME"); then
-        headscale users create "$VPS_USER_NAME" || die "failed to create user $VPS_USER_NAME"
-        vps_user_list=$(headscale users list 2>/dev/null)
-        vps_user_id=$(vps_user_id_for "$vps_user_list" "$VPS_USER_NAME") || die 'cannot resolve user id after create'
+    if ! vps_user_id=$(vps_resolve_user_id "$VPS_USER_NAME"); then
+        headscale users create "$VPS_USER_NAME" || die "failed to create user $VPS_USER_NAME (the name may already exist while 'headscale users list' cannot be parsed on this system; run it manually and report the exact output)"
+        vps_user_id=$(vps_resolve_user_id "$VPS_USER_NAME") || die 'cannot resolve user id after create'
         log_change "created Headscale user $VPS_USER_NAME (id $vps_user_id)"
     fi
     vps_key=$(headscale preauthkeys create --user "$vps_user_id" --expiration "${VPS_KEY_EXPIRATION:-2h}") || {

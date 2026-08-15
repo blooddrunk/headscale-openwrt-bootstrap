@@ -114,6 +114,21 @@ assert_contains "$OUT" 'already exists'
 OUT=$(vps issue-key --user attic)
 printf '%s\n' "$OUT" | grep -qF 'hskey-auth-FIXTURE3' || fail 'issue-key must resolve a pre-existing user by username'
 
+# Primary lookup goes through the filtered list: a genuinely absent user is
+# still created (empty display name, username in the Username column).
+OUT=$(vps ensure-user --user garage)
+assert_contains "$OUT" 'User garage created'
+assert_file_contains "$USERS" '4||garage'
+[ "$(wc -l < "$USERS")" = 4 ] || fail 'ensure-user must create a genuinely absent user'
+
+# Fallback lookup: Headscale without `users list --name` must still resolve an
+# existing user from the unfiltered table (header-aware parse, no duplicates).
+OUT=$(env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$VROOT" FAKE_LOG="$VLOG" FAKE_NO_NAME_FILTER=1 \
+    PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VROOT" --domain hs.example.com \
+    --expected-public-ip 203.0.113.10 ensure-user --user garage)
+assert_contains "$OUT" 'already exists'
+[ "$(wc -l < "$USERS")" = 4 ] || fail 'fallback lookup must not duplicate users'
+
 OUT=$(vps issue-key --user home)
 KEY=$(printf '%s\n' "$OUT" | grep -F 'hskey-auth' | sed -n '1p')
 [ -n "$KEY" ] || fail 'issue-key did not emit a key'

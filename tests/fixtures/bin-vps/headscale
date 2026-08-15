@@ -28,6 +28,7 @@ for arg in "$@"; do
     case "$prev" in
         -c) config_arg=$arg; prev=$arg; continue ;;
         --user) user_id=$arg; prev=$arg; continue ;;
+        --name) name_filter=$arg; prev=$arg; continue ;;
         --expiration) prev=$arg; continue ;;
         --identifier) node_id=$arg; prev=$arg; continue ;;
         --routes) routes=$arg; prev=$arg; continue ;;
@@ -64,9 +65,15 @@ case "$cmd" in
             list)
                 # Headscale >= 0.26 table: "Name" is the display name (empty
                 # for plain `users create`), the username lives in "Username".
+                # --name filters server-side on the username; releases without
+                # the flag are emulated via FAKE_NO_NAME_FILTER=1.
+                if [ -n "$name_filter" ] && [ "${FAKE_NO_NAME_FILTER:-0}" = 1 ]; then
+                    printf 'Error: unknown flag: --name\n' >&2
+                    exit 1
+                fi
                 printf 'ID | Name | Username | Email | Created\n'
                 if [ -f "$STATE/users" ]; then
-                    awk -F'|' '{printf "%s | %s | %s | %s | 2026-01-01\n", $1, $2, $3, $4}' "$STATE/users"
+                    awk -F'|' -v f="${name_filter:-}" 'f == "" || $3 == f {printf "%s | %s | %s | %s | 2026-01-01\n", $1, $2, $3, $4}' "$STATE/users"
                 fi
                 ;;
             create)
