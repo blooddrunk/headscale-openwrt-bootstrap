@@ -44,6 +44,22 @@ run_ow() {
         "$OPENWRT_SCRIPT" --root "$ROOT" "$@"
 }
 
+# CIDR math invariants for addresses >= 128.0.0.0 (integer >= 2^31).  These
+# must survive busybox awk on 32-bit ARM, whose %d saturates at 2^31-1 - the
+# reason every high LAN address once collapsed to 127.255.255.255 - so no
+# big value may ever pass through a %d printf (lib/net.sh uses %.0f).
+. "$PROJECT_DIR/lib/net.sh"
+[ "$(net_network_of 192.168.6.1 24)" = 192.168.6.0 ] || fail 'net_network_of 192.168.6.1/24'
+[ "$(net_network_of 255.255.255.255 32)" = 255.255.255.255 ] || fail 'net_network_of /32'
+[ "$(net_network_of 128.0.0.1 8)" = 128.0.0.0 ] || fail 'net_network_of 128.0.0.1/8'
+[ "$(net_normalize_cidr 172.16.31.200/12)" = 172.16.0.0/12 ] || fail 'net_normalize_cidr /12'
+[ "$(net_ipv4_to_int 192.168.6.0)" = 3232237056 ] || fail 'net_ipv4_to_int high address'
+if net_cidr_overlaps 127.255.255.255/24 192.168.6.0/24; then
+    fail 'high addresses must not be judged as overlapping after saturation-style bugs'
+fi
+net_cidr_contains 192.168.6.0/24 192.168.6.200 || fail 'net_cidr_contains high address'
+net_cidr_overlaps 10.0.0.0/8 10.1.2.0/24 || fail 'net_cidr_overlaps nested ranges'
+
 # Deployed + joined, no routes advertised yet.
 make_joined_root() {
     ROOT=$TMP_DIR/$1

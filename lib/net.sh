@@ -2,6 +2,13 @@
 
 # IPv4/CIDR arithmetic without non-POSIX awk extensions (no compl()/bit ops).
 # Values stay below 2^32, which double-precision awk handles exactly.
+#
+# Every number that can reach or exceed 2^31 must be printed with %.0f,
+# never %d: busybox awk on 32-bit ARM (armv7 Kwrt builds) casts %d through a
+# C int, and the ARM float-to-int conversion SATURATES at 2^31-1.  Observed
+# on a real router: any address >= 128.0.0.0 collapsed to 127.255.255.255
+# (INT_MAX), making the discovered LAN CIDR useless and bogus overlap
+# warnings fire.  %.0f keeps everything in double precision up to 2^53.
 
 net_is_ipv4() {
     printf '%s\n' "$1" | awk -F. '
@@ -32,7 +39,7 @@ net_is_ipv4_cidr() {
 }
 
 net_ipv4_to_int() {
-    printf '%s\n' "$1" | awk -F. '{ printf "%d", ((($1 * 256 + $2) * 256 + $3) * 256 + $4) }'
+    printf '%s\n' "$1" | awk -F. '{ printf "%.0f", ((($1 * 256 + $2) * 256 + $3) * 256 + $4) }'
 }
 
 net_int_to_ipv4() {
@@ -51,7 +58,7 @@ net_cidr_info() {
             val = (((o[1] * 256 + o[2]) * 256 + o[3]) * 256 + o[4])
             block = 1
             for (i = 0; i < 32 - p; i++) block *= 2
-            printf "%d %d\n", int(val / block) * block, block
+            printf "%.0f %.0f\n", int(val / block) * block, block
         }
     '
 }
