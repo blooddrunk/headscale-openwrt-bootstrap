@@ -52,7 +52,7 @@ LuCI helper）叠加时，最常见的故障是"谁都在管同一个接口/IP/�
 
 ### VPS 端（headscale-vps.sh）
 
-~~~sh
+```sh
 git clone https://github.com/blooddrunk/headscale-openwrt-bootstrap.git
 cd headscale-openwrt-bootstrap
 
@@ -69,11 +69,11 @@ sudo ./headscale-vps.sh status
 # 4. 建用户、发一次性注册密钥
 sudo ./headscale-vps.sh ensure-user --user home
 sudo ./headscale-vps.sh issue-key --user home --expiration 2h
-~~~
+```
 
 ### OpenWrt 端（tailscale-openwrt.sh）
 
-~~~sh
+```sh
 scp -r headscale-openwrt-bootstrap root@192.168.1.1:/root/
 ssh root@192.168.1.1
 cd /root/headscale-openwrt-bootstrap
@@ -96,17 +96,17 @@ cd /root/headscale-openwrt-bootstrap
 
 # 4. （可选）把 LAN 网段作为 subnet router 广播出去
 ./tailscale-openwrt.sh --login-server https://hs.example.com enable-subnet
-~~~
+```
 
 `--auth-key-file` 和 `--auth-key-stdin` 互斥。`--auth-key-stdin` 不会把
 key 放进命令参数或日志；脚本只读取一行非空内容，内部用 `0600` 临时文件
 通过 `file:` 交给 Tailscale，并在成功或失败退出时清理该临时文件。若使用
 管道，也可以这样调用：
 
-~~~sh
+```sh
 printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
     --login-server https://hs.example.com --auth-key-stdin join
-~~~
+```
 
 `profile-add` 同样支持这两种输入方式；已注册到目标网络、无需重新登录时，
 脚本不会读取 stdin。
@@ -115,10 +115,10 @@ printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
 192.168.10.129/25 → 192.168.10.128/25），随后停在"已广告、等待批准"
 状态，并打印 VPS 侧的批准命令：
 
-~~~sh
+```sh
 # 在 VPS 上执行
 sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
-~~~
+```
 
 ## 多 profile 与故障切换（OpenWrt 端）
 
@@ -134,13 +134,13 @@ profile 列表是项目自有的 `/etc/config/tailscale-bootstrap`，与
 此前已经通过 `join` 注册到目标网络，仍需显式执行一次 `profile-add` 才会
 把现有注册登记进列表：
 
-~~~sh
+```sh
 # 已通过 join 注册到当前网络时，不会重新登录，也不会读取 stdin
 ./tailscale-openwrt.sh --login-server https://hs-a.example.com \
     --auth-key-stdin --priority 10 profile-add
-~~~
+```
 
-~~~sh
+```sh
 # 1. 登记第一个网络（未注册时也可直接用 profile-add 代替 join）
 ./tailscale-openwrt.sh --login-server https://hs-a.example.com \
     --auth-key-file /tmp/key-a --priority 10 profile-add
@@ -160,7 +160,7 @@ profile 列表是项目自有的 `/etc/config/tailscale-bootstrap`，与
 
 # 5. 随时把某个网络从列表移除（加 --delete-identity 会同时注销该身份）
 ./tailscale-openwrt.sh --login-server https://hs-b.example.com profile-remove
-~~~
+```
 
 watchdog（`/usr/sbin/tailscale-failover`，procd 守护 `tailscale-failover`）
 的行为边界：
@@ -191,23 +191,23 @@ subnet router 需在新服务器重新批准。
 两个脚本都支持 `--json`、`--quiet` 机器可读输出；`discover`/`plan`/
 `status` 永远只读，`plan` 发现硬冲突时退出码为 2。
 
-| 命令 | 端 | 说明 |
-| --- | --- | --- |
-| `discover` / `plan` / `status` / `verify` | 双端 | 只读检查环境、展示计划、校验健康 |
-| `backup` | 双端 | 创建带 manifest 的私有时间戳快照，不停服务 |
-| `install` | 双端 | 全新安装（VPS：.deb；OpenWrt：opkg/apk 包 + tailscale-core） |
-| `apply` | 双端 | 幂等收敛：已满足的状态不会重做、不会无谓重启 |
-| `join` | OpenWrt | 用 `file:` auth key（`--auth-key-file` 或 `--auth-key-stdin`）注册，拒绝静默切换 ControlURL |
-| `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 定优先级，`--delete-identity` 同时注销身份） |
-| `switch-to` | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验） |
-| `enable-failover` / `disable-failover` | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog |
-| `enable-subnet` / `disable-subnet` | OpenWrt | 广播/撤回 LAN 网段，附 fw4 forwarding 事务 |
-| `allow-wan-udp [false]` | OpenWrt | 添加/移除最窄的 WAN UDP 41641 入站规则 |
-| `update` | 双端 | 升级（VPS 遵守 minor 顺序；OpenWrt 只重启 tailscale-core 并校验身份不变） |
-| `rollback [BACKUP_ID]` | 双端 | 把配置+数据+（VPS）软件包作为一个快照整体恢复 |
-| `cleanup` | 双端 | 删除脚本自管的内容，保留数据/身份/软件包 |
-| `purge` / `purge-identity` | 双端 | 破坏性操作，必须 `--yes-i-understand`，执行前做最终备份 |
-| `ensure-user` / `issue-key` / `approve-route` | VPS | 用户与注册密钥管理、路由批准 |
+| 命令                                              | 端      | 说明                                                                                        |
+| ------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `discover` / `plan` / `status` / `verify`         | 双端    | 只读检查环境、展示计划、校验健康                                                            |
+| `backup`                                          | 双端    | 创建带 manifest 的私有时间戳快照，不停服务                                                  |
+| `install`                                         | 双端    | 全新安装（VPS：.deb；OpenWrt：opkg/apk 包 + tailscale-core）                                |
+| `apply`                                           | 双端    | 幂等收敛：已满足的状态不会重做、不会无谓重启                                                |
+| `join`                                            | OpenWrt | 用 `file:` auth key（`--auth-key-file` 或 `--auth-key-stdin`）注册，拒绝静默切换 ControlURL |
+| `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 定优先级，`--delete-identity` 同时注销身份）           |
+| `switch-to`                                       | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验）                                            |
+| `enable-failover` / `disable-failover`            | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog                                         |
+| `enable-subnet` / `disable-subnet`                | OpenWrt | 广播/撤回 LAN 网段，附 fw4 forwarding 事务                                                  |
+| `allow-wan-udp [false]`                           | OpenWrt | 添加/移除最窄的 WAN UDP 41641 入站规则                                                      |
+| `update`                                          | 双端    | 升级（VPS 遵守 minor 顺序；OpenWrt 只重启 tailscale-core 并校验身份不变）                   |
+| `rollback [BACKUP_ID]`                            | 双端    | 把配置+数据+（VPS）软件包作为一个快照整体恢复                                               |
+| `cleanup`                                         | 双端    | 删除脚本自管的内容，保留数据/身份/软件包                                                    |
+| `purge` / `purge-identity`                        | 双端    | 破坏性操作，必须 `--yes-i-understand`，执行前做最终备份                                     |
+| `ensure-user` / `issue-key` / `approve-route`     | VPS     | 用户与注册密钥管理、路由批准                                                                |
 
 常用参数：VPS 侧 `--domain`、`--expected-public-ip`、`--proxy`、
 `--listen/--metrics-listen/--grpc-listen`、`--version`、`--user`、
@@ -221,13 +221,13 @@ subnet router 需在新服务器重新批准。
 
 ## 反向代理模式（`--proxy`）
 
-| 模式 | 行为 |
-| --- | --- |
+| 模式     | 行为                                                                                                                                                                                                               |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `1panel` | 检测 1Panel OpenResty 容器（host 网络 + 挂载），只补齐已有站点缺失的必要指令（如 `proxy_buffering off;`），`openresty -t` 通过才 reload。站点和证书请先在 1Panel 界面创建（upstream 填 `http://127.0.0.1:8080`）。 |
-| `caddy` | 80/443 空闲时自动安装 Caddy，用 BEGIN/END 标记管理专属站点块，`caddy validate` 通过才重载。 |
-| `nginx` | 写入 `/etc/nginx/conf.d/headscale-bootstrap.conf`（标记块）。TLS 证书请在模板标注处自行提供，`nginx -t` 不过即还原。 |
-| `none` | 不管理任何反代；TLS 归属需自行明确。 |
-| `auto` | 默认。按上述顺序自动判断，判断不了就阻断而不是猜。 |
+| `caddy`  | 80/443 空闲时自动安装 Caddy，用 BEGIN/END 标记管理专属站点块，`caddy validate` 通过才重载。                                                                                                                        |
+| `nginx`  | 写入 `/etc/nginx/conf.d/headscale-bootstrap.conf`（标记块）。TLS 证书请在模板标注处自行提供，`nginx -t` 不过即还原。                                                                                               |
+| `none`   | 不管理任何反代；TLS 归属需自行明确。                                                                                                                                                                               |
+| `auto`   | 默认。按上述顺序自动判断，判断不了就阻断而不是猜。                                                                                                                                                                 |
 
 域名必须直接解析到 VPS（Cloudflare 请用 DNS Only 灰云）；脚本从不修改
 DNS 记录，也从不读取 1Panel 保存的 Cloudflare token。
@@ -243,9 +243,9 @@ DNS 记录，也从不读取 1Panel 保存的 Cloudflare token。
 文件可能内部不一致，`rollback` 恢复时会明确告警。带 `.INCOMPLETE` 标记
 的目录不会被 rollback 接受。
 
-~~~sh
+```sh
 cd /var/backups/headscale-bootstrap/<timestamp> && sudo sha256sum -c manifest.sha256
-~~~
+```
 
 备份属于敏感运维数据，请保持在 Git 之外（`.gitignore` 已覆盖常见敏感
 文件名；唯一例外是测试用的假身份 fixture，按精确路径放行）。
@@ -267,7 +267,7 @@ profiles、failover_enabled、subnets 等）。auth key、API token、
 `curl .../headscale-vps.sh | sh`。请保持目录结构下载（生产环境建议固定
 为已审阅的完整 commit SHA，不要用会漂移的 `main`）：
 
-~~~sh
+```sh
 RAW_BASE=https://raw.githubusercontent.com/blooddrunk/headscale-openwrt-bootstrap/<SHA>
 TARGET=/root/headscale-openwrt-bootstrap
 fetch() {
@@ -284,11 +284,11 @@ for path in headscale-vps.sh tailscale-openwrt.sh \
 done
 sh -n "$TARGET"/*.sh "$TARGET"/lib/*.sh   # 下载后先做语法检查
 chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
-~~~
+```
 
 ## 运行测试
 
-~~~sh
+```sh
 ./tests/test-milestone1.sh          # 只读探测、指纹、硬阻断、私有备份
 ./tests/test-vps-install.sh         # VPS 安装/apply、1Panel 与 Caddy 路径
 ./tests/test-openwrt-core.sh        # 包/core/fw4 事务/join（含多网络守卫）
@@ -296,7 +296,7 @@ chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
 ./tests/test-update-rollback.sh     # 双端升级顺序、回退、清理
 ./tests/test-failure-injection.sh   # 失败注入、幂等、重启稳态
 ./tests/test-openwrt-failover.sh    # profile 登记/切换/移除、watchdog 决策
-~~~
+```
 
 测试完全离线：使用临时 fixture 根目录和受控的假命令（可注入故障），
 不会触碰真实 VPS 或路由器，也不会执行任何目标 init 脚本。依赖 POSIX
@@ -305,13 +305,13 @@ chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
 
 ## 仓库结构
 
-~~~text
+```text
 headscale-vps.sh            VPS 端入口
 tailscale-openwrt.sh        OpenWrt 端入口
 lib/                        共享库与两端操作实现
 templates/                  tailscale-core/failover 服务与反代配置模板
 tests/                      fixture 测试与假命令（均为合成数据）
-~~~
+```
 
 ## 已知边界
 
