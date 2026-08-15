@@ -13,5 +13,9 @@ case "$1" in
         [ "${FAKE_FAIL_FW4_CHECK:-0}" = 1 ] && { printf 'fw4 check failed (injected)\n' >&2; exit 1; }
         printf 'syntax ok\n'
         ;;
+    reload)
+        [ "${FAKE_FAIL_FW4_RELOAD:-0}" = 1 ] && { printf 'fw4 reload failed (injected)\n' >&2; exit 1; }
+        printf 'reload ok\n'
+        ;;
     *) printf 'syntax ok\n' ;;
 esac

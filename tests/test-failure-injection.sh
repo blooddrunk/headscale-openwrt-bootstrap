@@ -214,6 +214,46 @@ if [ "$OW_SKIP" = 0 ]; then
     grep -qF '"fw4_device":"tailscale"' "$TMP_DIR/reboot-status.json" || fail 'zone binding lost'
     grep -qF '"control_url":"'"$LOGIN"'"' "$TMP_DIR/reboot-status.json" || fail 'ControlURL lost'
     assert_file_contains "$OROOT/.ts-state/prefs" '192.168.10.0/24'
+
+    # 13. /etc/init.d/firewall reload fails -> the fw4 reload fallback applies
+    #     the ruleset and join still completes (Kwrt-style patched init).
+    #     The fixture node is pre-registered, so join converges without a new
+    #     login; its zone sections are removed first to force a pending
+    #     firewall transaction.
+    make_ow_root ow-fi13
+    ow install >/dev/null
+    env FAKE_OPENWRT_ROOT="$OROOT" PATH="$OW_BIN:$PATH" sh -c \
+        'uci -q delete firewall.tailscale; uci -q delete firewall.ts_to_lan; uci -q delete firewall.ts_wan_udp; uci commit firewall'
+    KFILE=$TMP_DIR/k13
+    printf 'hskey-auth-FI13\n' > "$KFILE"; chmod 600 "$KFILE"
+    : > "$OLOG"
+    OUT=$(env FAKE_OPENWRT_ROOT="$OROOT" FAKE_LOG="$OLOG" FAKE_FAIL_FIREWALL_RELOAD=1 \
+        PATH="$OW_BIN:$PATH" "$OW_SCRIPT" --root "$OROOT" --login-server "$LOGIN" \
+        --auth-key-file "$KFILE" join 2>&1)
+    assert_contains "$OUT" 'Join verified'
+    assert_contains "$OUT" 'retrying the reload with fw4 directly'
+    assert_file_contains "$OLOG" 'fw4 reload'
+    [ "$(grep -c "config zone 'tailscale'" "$OROOT/etc/config/firewall")" = 1 ] || fail 'zone missing after fallback reload'
+    rm -f "$KFILE"
+
+    # 14. Both reload paths fail while the committed config still passes
+    #     fw4 check: join warns and continues instead of aborting the
+    #     transaction with a committed-but-never-verified config.
+    make_ow_root ow-fi14
+    ow install >/dev/null
+    env FAKE_OPENWRT_ROOT="$OROOT" PATH="$OW_BIN:$PATH" sh -c \
+        'uci -q delete firewall.tailscale; uci -q delete firewall.ts_to_lan; uci -q delete firewall.ts_wan_udp; uci commit firewall'
+    KFILE=$TMP_DIR/k14
+    printf 'hskey-auth-FI14\n' > "$KFILE"; chmod 600 "$KFILE"
+    : > "$OLOG"
+    OUT=$(env FAKE_OPENWRT_ROOT="$OROOT" FAKE_LOG="$OLOG" FAKE_FAIL_FIREWALL_RELOAD=1 \
+        FAKE_FAIL_FW4_RELOAD=1 PATH="$OW_BIN:$PATH" "$OW_SCRIPT" --root "$OROOT" \
+        --login-server "$LOGIN" --auth-key-file "$KFILE" join 2>&1)
+    assert_contains "$OUT" 'Join verified'
+    assert_contains "$OUT" 'firewall reload failed on this router'
+    [ "$(grep -c "config zone 'tailscale'" "$OROOT/etc/config/firewall")" = 1 ] || fail 'zone missing after warn-continue'
+    [ -z "$(FAKE_OPENWRT_ROOT="$OROOT" PATH="$OW_BIN:$PATH" uci -q changes firewall 2>/dev/null)" ] || fail 'firewall UCI must be clean after warn-continue'
+    rm -f "$KFILE"
 fi
 
 printf 'Failure injection and idempotency tests passed.\n'

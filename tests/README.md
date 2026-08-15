@@ -21,7 +21,11 @@ root for the `[ -c ]` check); without it those cases are skipped with a
 message.
 
 Failure injection is env-driven on the fakes, e.g. `FAKE_FAIL_FW4_CHECK=1`,
-`FAKE_FAIL_OPENRESTY_T=1`, `FAKE_FAIL_CONFIGTEST=1`, `FAKE_FAIL_OPKG=1`,
+`FAKE_FAIL_FIREWALL_RELOAD=1` (emulates a patched/broken init wrapper on
+forks like Kwrt; the script must fall back to `fw4 reload`),
+`FAKE_FAIL_FW4_RELOAD=1` (then the script warns and continues while the
+committed config still passes `fw4 check`), `FAKE_FAIL_OPENRESTY_T=1`,
+`FAKE_FAIL_CONFIGTEST=1`, `FAKE_FAIL_OPKG=1`,
 `FAKE_FAIL_AUTH=1`, `FAKE_FAIL_TS_UP=1`, `FAKE_FAIL_TS_LOGIN=1`,
 `FAKE_FAIL_TS_SWITCH=1`, `FAKE_PROBE_DOWN="host1 host2"` (fake curl
 probe failures for the failover watchdog), `FAKE_MISMATCH_DEB=1`,

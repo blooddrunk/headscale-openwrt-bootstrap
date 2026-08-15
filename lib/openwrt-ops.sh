@@ -62,6 +62,10 @@ openwrt_init_action() {
         "$openwrt_init_script" "$@"
         return
     fi
+    if [ "$openwrt_init_service" = firewall ] && [ "$1" = reload ] && [ "${FAKE_FAIL_FIREWALL_RELOAD:-0}" = 1 ]; then
+        printf 'init firewall reload failed (injected)\n' >&2
+        return 1
+    fi
     case "$1" in
         enable)
             mkdir -p "$(openwrt_target_path /etc/rc.d)"
@@ -115,6 +119,31 @@ openwrt_uci_delete_if_exists() {
     return 0
 }
 
+openwrt_firewall_reload() {
+    # Reload fw4 and surface the real cause when it fails.  Some OpenWrt
+    # forks return nonzero from /etc/init.d/firewall reload for reasons
+    # outside this script's managed sections (patched init scripts, `config
+    # include` reload_commands from third-party packages).  Capture the
+    # wrapper output so the cause is visible, then retry once with plain
+    # `fw4 reload`, which bypasses the init wrapper.  Returns 0 only when a
+    # reload path actually succeeded.
+    openwrt_fwr_tmp=${TMPDIR:-/tmp}/fw-reload.$$
+    if openwrt_init_action firewall reload >"$openwrt_fwr_tmp" 2>&1; then
+        cat "$openwrt_fwr_tmp" >&2
+        rm -f "$openwrt_fwr_tmp"
+        return 0
+    fi
+    log_warn '/etc/init.d/firewall reload returned nonzero; its output was:'
+    sed 's/^/  /' "$openwrt_fwr_tmp" >&2
+    rm -f "$openwrt_fwr_tmp"
+    log_info 'retrying the reload with fw4 directly'
+    if fw4 reload; then
+        log_change 'firewall reloaded via fw4 reload (the init-script wrapper had failed)'
+        return 0
+    fi
+    return 1
+}
+
 openwrt_firewall_commit_or_revert() {
     # fw4 check BEFORE commit; reload firewall only; network is never reloaded.
     if [ -z "$(uci changes firewall 2>/dev/null)" ]; then
@@ -126,7 +155,18 @@ openwrt_firewall_commit_or_revert() {
         die 'fw4 check failed; uncommitted firewall changes were reverted (nothing was committed or reloaded)'
     fi
     uci commit firewall || die 'uci commit firewall failed'
-    openwrt_init_action firewall reload || die '/etc/init.d/firewall reload failed'
+    if ! openwrt_firewall_reload; then
+        # The managed sections passed fw4 check and are committed; the reload
+        # failure comes from this router's own reload machinery.  Aborting
+        # would leave a valid committed config and a half-finished join for a
+        # cause outside this script, so verify the config still checks out
+        # and continue with a warning; the join-time verification still runs.
+        if fw4 check >/dev/null 2>&1; then
+            log_warn 'firewall reload failed on this router (see output above); the committed config is valid and applies on the next successful firewall restart'
+            return 0
+        fi
+        die 'firewall reload failed and the committed config fails fw4 check; inspect with: fw4 check'
+    fi
     log_change 'fw4 check passed; firewall committed and firewall reloaded'
     return 0
 }
@@ -1372,7 +1412,7 @@ openwrt_rollback() {
     uci revert firewall 2>/dev/null || true
     uci revert network 2>/dev/null || true
     uci revert "$OPENWRT_UCI_TSBOOT" 2>/dev/null || true
-    openwrt_init_action firewall reload || log_warn 'firewall reload after restore failed'
+    openwrt_firewall_reload || log_warn 'firewall reload after restore failed'
     openwrt_init_action tailscale-core enable || die 'failed to re-enable tailscale-core'
     openwrt_init_action tailscale-core start
 
