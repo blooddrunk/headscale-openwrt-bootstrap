@@ -36,9 +36,12 @@ LuCI helper）叠加时，最常见的故障是"谁都在管同一个接口/IP/�
   `uci commit firewall` → `/etc/init.d/firewall reload`，检查不过即整体
   回滚未提交变更。
 - **单网络原则**：节点已注册到其他 Headscale 时，join 会硬停并给出三个
-  明确选项（保留当前 / 手动切换 profile / `purge-identity` 重注册），
+  明确选项（保留当前 / 切换 profile / `purge-identity` 重注册），
   绝不静默换网；已注册节点不用 `tailscale up --reset`，偏好通过
-  `tailscale set` 幂等收敛。
+  `tailscale set` 幂等收敛。多网络仍以"同一时刻只有一个活动 tailnet"
+  为前提——profile 登记与 failover 守护只在已注册的 profile 之间
+  串行切换，从不并发连接，也从不在切换时使用 auth key（见
+  "多 profile 与故障切换"）。
 - **秘密不落日志**：auth key 只输出一次（stdout 或 0600 权限的文件），
   `tailscaled.state`、数据库、TLS 私钥永不打印。
 - **默认最小权限**：exit node、IPv6 subnet routing、embedded DERP 默认
@@ -99,6 +102,60 @@ cd /root/headscale-openwrt-bootstrap
 sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 ~~~
 
+## 多 profile 与故障切换（OpenWrt 端）
+
+远程只能通过 tailnet 访问的路由器有一个现实风险：控制服务器一挂，
+人就再也无法远程登录路由器去手动换网。profile 列表 + failover 守护
+进程就是为这个场景准备的——它仍然**不会同时连接两个网络**（官方客户端
+同一时刻只有一个活动 tailnet），只是把"已注册的多个网络"登记在路由器
+上，由 watchdog 在当前网络失效时自动切换：
+
+~~~sh
+# 1. 登记第一个网络（未注册时也可直接用 profile-add 代替 join）
+./tailscale-openwrt.sh --login-server https://hs-a.example.com \
+    --auth-key-file /tmp/key-a --priority 10 profile-add
+
+# 2. 登记第二个网络（tailscale login 新建 profile，成功后自动切回 A，
+#    远程会话不会被打断；重复登记会拒绝，不会静默换网）
+./tailscale-openwrt.sh --login-server https://hs-b.example.com \
+    --auth-key-file /tmp/key-b profile-add        # priority 默认追加 +10
+
+# 3. 查看列表 / 手动切换
+./tailscale-openwrt.sh profile-list
+./tailscale-openwrt.sh --login-server https://hs-b.example.com switch-to
+
+# 4. 启用自动故障切换
+./tailscale-openwrt.sh enable-failover            # 可选调参见 --help
+./tailscale-openwrt.sh status                     # 含 failover 健康项
+
+# 5. 随时把某个网络从列表移除（加 --delete-identity 会同时注销该身份）
+./tailscale-openwrt.sh --login-server https://hs-b.example.com profile-remove
+~~~
+
+watchdog（`/usr/sbin/tailscale-failover`，procd 守护 `tailscale-failover`）
+的行为边界：
+
+- 每 `check_interval` 秒探测所有登记网络的 `login_server/health`
+  （curl → wget → uclient-fetch，需要可用 CA 证书）；
+- 活动网络连续 `failure_threshold` 次探测失败（或控制面可达但
+  BackendState ≠ Running，例如节点被服务端吊销）即切换到优先级最高
+  （数字最小）且连续 `recovery_threshold` 次探测正常的候选；
+- `--failback true` 才会回切更高优先级网络，默认保持稳定；
+- `cooldown` 秒内不发生第二次切换，切换后立即收敛安全偏好
+  （accept-dns=false / accept-routes=false）；
+- 手动切到列表之外的网络时，只要它健康 watchdog 就不干预；失效才接管；
+- 它只调用 `tailscale switch`，从不 login、从不使用 auth key、
+  从不改 netifd/fw4；配置与身份分离：列表在
+  `/etc/config/tailscale-bootstrap`（项目自有文件），身份仍在
+  `/etc/tailscale/tailscaled.state`；
+- 守护文件带指纹校验，被篡改后 plan/status 会阻断，
+  `enable-failover` 自动备份并从模板修复。
+
+注意事项：每个网络都需要一个你能访问的对端节点（手机/电脑同时加入
+两个 tailnet，或两个网络各有一个 exit node），否则切换后依旧没有入口。
+每台 Headscale 侧的路由批准（approve-route）是独立的，切换后如需
+subnet router 需在新服务器重新批准。
+
 ## 命令参考
 
 两个脚本都支持 `--json`、`--quiet` 机器可读输出；`discover`/`plan`/
@@ -111,6 +168,9 @@ sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 | `install` | 双端 | 全新安装（VPS：.deb；OpenWrt：opkg/apk 包 + tailscale-core） |
 | `apply` | 双端 | 幂等收敛：已满足的状态不会重做、不会无谓重启 |
 | `join` | OpenWrt | 用 `file:` auth key 注册，拒绝静默切换 ControlURL |
+| `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 定优先级，`--delete-identity` 同时注销身份） |
+| `switch-to` | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验） |
+| `enable-failover` / `disable-failover` | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog |
 | `enable-subnet` / `disable-subnet` | OpenWrt | 广播/撤回 LAN 网段，附 fw4 forwarding 事务 |
 | `allow-wan-udp [false]` | OpenWrt | 添加/移除最窄的 WAN UDP 41641 入站规则 |
 | `update` | 双端 | 升级（VPS 遵守 minor 顺序；OpenWrt 只重启 tailscale-core 并校验身份不变） |
@@ -123,7 +183,10 @@ sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 `--listen/--metrics-listen/--grpc-listen`、`--version`、`--user`、
 `--expiration`、`--output`、`--node-id`、`--route`；OpenWrt 侧
 `--login-server`、`--auth-key-file`、`--service-mode`、`--accept-dns`、
-`--accept-routes`、`--subnet`、`--min-client-version`。完整列表见
+`--accept-routes`、`--subnet`、`--min-client-version`、`--priority`、
+`--delete-identity`，以及 enable-failover 的
+`--check-interval/--failure-threshold/--recovery-threshold/--failback/
+--cooldown/--probe-timeout/--health-path`。完整列表见
 `--help`。
 
 ## 反向代理模式（`--proxy`）
@@ -163,7 +226,10 @@ cd /var/backups/headscale-bootstrap/<timestamp> && sudo sha256sum -c manifest.sh
 - OpenWrt：`/etc/tailscale-bootstrap/state.json`
 
 只记录非秘密的管理信息（domain、proxy_mode、service_mode、login_server、
-subnets 等）。auth key、API token、`tailscaled.state` 内容永不写入。
+profiles、failover_enabled、subnets 等）。auth key、API token、
+`tailscaled.state` 内容永不写入。多 profile 列表本身的权威来源是
+`/etc/config/tailscale-bootstrap`（UCI），watchdog 每个周期重新读取，
+改表即时生效、无需重启。
 
 ## 把脚本放到没有 Git 的设备上
 
@@ -199,6 +265,7 @@ chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
 ./tests/test-openwrt-subnet.sh      # subnet 与 WAN UDP 事务
 ./tests/test-update-rollback.sh     # 双端升级顺序、回退、清理
 ./tests/test-failure-injection.sh   # 失败注入、幂等、重启稳态
+./tests/test-openwrt-failover.sh    # profile 登记/切换/移除、watchdog 决策
 ~~~
 
 测试完全离线：使用临时 fixture 根目录和受控的假命令（可注入故障），
@@ -209,11 +276,11 @@ chmod 700 "$TARGET"/*.sh "$TARGET"/lib/*.sh
 ## 仓库结构
 
 ~~~text
-headscale-vps.sh        VPS 端入口
-tailscale-openwrt.sh    OpenWrt 端入口
-lib/                    共享库与两端操作实现
-templates/              tailscale-core 服务与反代配置模板
-tests/                  fixture 测试与假命令（均为合成数据）
+headscale-vps.sh            VPS 端入口
+tailscale-openwrt.sh        OpenWrt 端入口
+lib/                        共享库与两端操作实现
+templates/                  tailscale-core/failover 服务与反代配置模板
+tests/                      fixture 测试与假命令（均为合成数据）
 ~~~
 
 ## 已知边界
@@ -222,7 +289,12 @@ tests/                  fixture 测试与假命令（均为合成数据）
   站点内缺失的必要指令。
 - nginx 模式不负责申请证书。
 - 不支持同时连接多个 Headscale 网络（官方客户端同一时刻只有一个活动
-  tailnet）；如需两个独立网络，请部署两个 Headscale 实例并在客户端切换。
+  tailnet）。多网络场景使用 profile 列表 + failover 在网络间串行切换
+  （见上文"多 profile 与故障切换"）；若要真正同时在线，只能运行多个
+  独立的 tailscaled 实例，超出本项目范围。
+- failover 的健康探测是控制面探测（`/health`）加 BackendState 检查，
+  不代表该网络的数据面对你可用：每个登记的网络里仍需存在你可达的对端
+  节点，切换后才有远程入口。
 - 路由器真机重启后的完整验收建议人工执行一次（重启后运行 `status`
   即为自动检查）。
 - LuCI 界面里的"启用/停止/重启 Tailscale"按钮在本部署中不可用，daemon

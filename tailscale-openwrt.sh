@@ -36,6 +36,15 @@ OPENWRT_ENABLE_SUBNET=false
 OPENWRT_ALLOW_WAN_UDP=false
 OPENWRT_ALLOW_WAN_UDP_EXPLICIT=0
 OPENWRT_MIN_CLIENT_VERSION=
+OPENWRT_PRIORITY=
+OPENWRT_CHECK_INTERVAL=
+OPENWRT_FAILURE_THRESHOLD=
+OPENWRT_RECOVERY_THRESHOLD=
+OPENWRT_FAILBACK=
+OPENWRT_COOLDOWN=
+OPENWRT_PROBE_TIMEOUT=
+OPENWRT_HEALTH_PATH=
+OPENWRT_DELETE_IDENTITY=0
 OPENWRT_BACKUP_DIR=/root/tailscale-bootstrap-backups
 BOOTSTRAP_ROOT=/
 BOOTSTRAP_DRY_RUN=0
@@ -65,6 +74,21 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
                            bound to device tailscale0, prefs via tailscale set.
   join                     Register with --login-server using --auth-key-file
                            (file: key, no --reset); refuses a ControlURL switch.
+  profile-list             Read-only: the managed profile list and failover
+                           state from /etc/config/tailscale-bootstrap.
+  profile-add              Register --login-server as an ADDITIONAL tailscale
+                           profile (tailscale login; the active network is
+                           switched back afterwards) and record it with
+                           --priority (lower wins; default appends +10).
+  profile-remove           Drop --login-server from the profile list; add
+                           --delete-identity to also log that profile out.
+  switch-to                Manually switch to --login-server (must already be
+                           in the profile list); verified via ControlURL.
+  enable-failover          Install + start the tailscale-failover watchdog:
+                           probes every profile, switches when the active
+                           network breaks (failure_threshold probes), optional
+                           --failback true to prefer higher priority again.
+  disable-failover         Stop + disable the watchdog; profiles are kept.
   enable-subnet            Advertise --subnet (or the discovered LAN CIDR) and
                            add IPv4 tailscale->lan forwarding after fw4 check.
   disable-subnet           Withdraw --subnet and remove the forwarding.
@@ -72,8 +96,9 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
   update                   Upgrade the tailscale package; restarts
                            tailscale-core only and verifies identity kept.
   rollback [BACKUP_ID]     Restore configs, identity and init scripts.
-  cleanup                  Remove tailscale-core + managed firewall sections;
-                           keep identity and packages; never stops stock service.
+  cleanup                  Remove tailscale-core + failover watchdog + managed
+                           firewall sections; keep identities and packages;
+                           never stops stock service.
   purge-identity           Destructive: needs --yes-i-understand; backs up first.
 
 Options:
@@ -89,6 +114,17 @@ Options:
                               server release notes; never hardcoded).
   --enable-subnet[=true|false]
   --allow-wan-udp[=true|false]
+  --priority N             profile-add: priority, lower wins (default +10).
+  --delete-identity        profile-remove: also log the profile out.
+  --check-interval SEC     enable-failover tuning (default 60, min 10).
+  --failure-threshold N    failed probes before switching (default 3).
+  --recovery-threshold N   ok probes before a profile is a candidate
+                           (default 3).
+  --failback true|false    switch back to higher priority once it recovers
+                           (default false: stability first).
+  --cooldown SEC           minimum seconds between two switches (default 300).
+  --probe-timeout SEC      HTTPS probe timeout (default 5).
+  --health-path PATH       control-server health path (default /health).
   --root DIR                Test/fixture root; default is /.
   --backup-dir DIR          Backup directory in the selected root namespace.
   --dry-run                 Accepted for CLI compatibility.
@@ -102,7 +138,9 @@ Hard boundaries:
   - the stock /etc/init.d/tailscale is only disabled, never stopped/reloaded;
   - no tailscale up --reset; registered nodes converge via tailscale set;
   - firewall changes: pending UCI -> fw4 check -> commit -> firewall reload;
-  - no exit node, no IPv6 subnet routing, no simultaneous multi-Headscale.
+  - no exit node, no IPv6 subnet routing;
+  - one active tailnet at a time: failover switches registered profiles
+    serially and never runs two networks concurrently.
 EOF
 }
 
@@ -116,6 +154,15 @@ openwrt_parse_bool() {
 
 openwrt_need_value() {
     [ "$#" -ge 2 ] || die "option $1 needs a value"
+}
+
+openwrt_validate_positive_int() {
+    openwrt_vpi_name=$1
+    openwrt_vpi_value=$2
+    case "$openwrt_vpi_value" in
+        ''|*[!0-9]*) die "$openwrt_vpi_name must be a positive integer: $openwrt_vpi_value" ;;
+    esac
+    [ "$openwrt_vpi_value" -ge 1 ] || die "$openwrt_vpi_name must be >= 1: $openwrt_vpi_value"
 }
 
 openwrt_validate_options() {
@@ -145,6 +192,21 @@ openwrt_validate_options() {
             *) die "subnet must be an IPv4 CIDR such as 192.168.10.0/24: $OPENWRT_SUBNET" ;;
         esac
     fi
+    [ -n "$OPENWRT_PRIORITY" ] && openwrt_validate_positive_int --priority "$OPENWRT_PRIORITY"
+    [ -n "$OPENWRT_CHECK_INTERVAL" ] && openwrt_validate_positive_int --check-interval "$OPENWRT_CHECK_INTERVAL"
+    [ -n "$OPENWRT_FAILURE_THRESHOLD" ] && openwrt_validate_positive_int --failure-threshold "$OPENWRT_FAILURE_THRESHOLD"
+    [ -n "$OPENWRT_RECOVERY_THRESHOLD" ] && openwrt_validate_positive_int --recovery-threshold "$OPENWRT_RECOVERY_THRESHOLD"
+    [ -n "$OPENWRT_COOLDOWN" ] && openwrt_validate_positive_int --cooldown "$OPENWRT_COOLDOWN"
+    [ -n "$OPENWRT_PROBE_TIMEOUT" ] && openwrt_validate_positive_int --probe-timeout "$OPENWRT_PROBE_TIMEOUT"
+    case "$OPENWRT_HEALTH_PATH" in
+        '') ;;
+        /*) ;;
+        *) die "--health-path must start with / (got: $OPENWRT_HEALTH_PATH)" ;;
+    esac
+    case "$OPENWRT_FAILBACK" in
+        ''|true|false) ;;
+        *) die "--failback must be true or false (got: $OPENWRT_FAILBACK)" ;;
+    esac
     case "$OPENWRT_BACKUP_DIR" in
         /*) ;;
         *) die '--backup-dir must be an absolute path in the selected root namespace' ;;
@@ -157,7 +219,7 @@ openwrt_validate_options() {
 openwrt_parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            discover|plan|status|verify|backup|install|apply|join|update|enable-subnet|disable-subnet|allow-wan-udp|rollback|cleanup|purge-identity)
+            discover|plan|status|verify|backup|install|apply|join|profile-list|profile-add|profile-remove|switch-to|enable-failover|disable-failover|update|enable-subnet|disable-subnet|allow-wan-udp|rollback|cleanup|purge-identity)
                 [ -z "$OPENWRT_COMMAND" ] || die "multiple commands supplied: $OPENWRT_COMMAND and $1"
                 OPENWRT_COMMAND=$1
                 shift
@@ -242,6 +304,61 @@ openwrt_parse_args() {
                 fi
                 ;;
             --allow-wan-udp=*) OPENWRT_ALLOW_WAN_UDP_EXPLICIT=1; OPENWRT_ALLOW_WAN_UDP=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --priority)
+                openwrt_need_value "$@"
+                OPENWRT_PRIORITY=$2
+                shift 2
+                ;;
+            --priority=*) OPENWRT_PRIORITY=${1#*=}; shift ;;
+            --delete-identity) OPENWRT_DELETE_IDENTITY=1; shift ;;
+            --check-interval)
+                openwrt_need_value "$@"
+                OPENWRT_CHECK_INTERVAL=$2
+                shift 2
+                ;;
+            --check-interval=*) OPENWRT_CHECK_INTERVAL=${1#*=}; shift ;;
+            --failure-threshold)
+                openwrt_need_value "$@"
+                OPENWRT_FAILURE_THRESHOLD=$2
+                shift 2
+                ;;
+            --failure-threshold=*) OPENWRT_FAILURE_THRESHOLD=${1#*=}; shift ;;
+            --recovery-threshold)
+                openwrt_need_value "$@"
+                OPENWRT_RECOVERY_THRESHOLD=$2
+                shift 2
+                ;;
+            --recovery-threshold=*) OPENWRT_RECOVERY_THRESHOLD=${1#*=}; shift ;;
+            --failback)
+                if [ "$#" -ge 2 ]; then
+                    case "$2" in
+                        true|yes|1|on|false|no|0|off) OPENWRT_FAILBACK=$(openwrt_parse_bool "$2"); shift 2 ;;
+                        *) OPENWRT_FAILBACK=true; shift ;;
+                    esac
+                else
+                    OPENWRT_FAILBACK=true
+                    shift
+                fi
+                ;;
+            --failback=*) OPENWRT_FAILBACK=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --cooldown)
+                openwrt_need_value "$@"
+                OPENWRT_COOLDOWN=$2
+                shift 2
+                ;;
+            --cooldown=*) OPENWRT_COOLDOWN=${1#*=}; shift ;;
+            --probe-timeout)
+                openwrt_need_value "$@"
+                OPENWRT_PROBE_TIMEOUT=$2
+                shift 2
+                ;;
+            --probe-timeout=*) OPENWRT_PROBE_TIMEOUT=${1#*=}; shift ;;
+            --health-path)
+                openwrt_need_value "$@"
+                OPENWRT_HEALTH_PATH=$2
+                shift 2
+                ;;
+            --health-path=*) OPENWRT_HEALTH_PATH=${1#*=}; shift ;;
             --root)
                 openwrt_need_value "$@"
                 BOOTSTRAP_ROOT=$2
@@ -354,6 +471,42 @@ openwrt_core_fingerprint() {
     fi
 }
 
+openwrt_failover_fingerprint() {
+    openwrt_fo_file=$1
+    if [ ! -f "$openwrt_fo_file" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+    if grep -qF 'TS_FAILOVER_INIT_v1' "$openwrt_fo_file" 2>/dev/null \
+        && grep -qF 'procd_open_instance failover' "$openwrt_fo_file" 2>/dev/null \
+        && grep -qF '/usr/sbin/tailscale-failover' "$openwrt_fo_file" 2>/dev/null \
+        && ! grep -qF '/etc/init.d/network reload' "$openwrt_fo_file" 2>/dev/null \
+        && ! grep -qF 'uci commit network' "$openwrt_fo_file" 2>/dev/null; then
+        printf 'verified\n'
+    else
+        printf 'unverified\n'
+    fi
+}
+
+openwrt_watchdog_fingerprint() {
+    openwrt_wd_file=$1
+    if [ ! -f "$openwrt_wd_file" ]; then
+        printf 'absent\n'
+        return 0
+    fi
+    if grep -qF 'TS_FAILOVER_WATCHDOG_v1' "$openwrt_wd_file" 2>/dev/null \
+        && grep -qF 'failover_probe' "$openwrt_wd_file" 2>/dev/null \
+        && grep -qF 'tailscale switch' "$openwrt_wd_file" 2>/dev/null \
+        && ! grep -qF 'tailscale up' "$openwrt_wd_file" 2>/dev/null \
+        && ! grep -qF 'auth-key' "$openwrt_wd_file" 2>/dev/null \
+        && ! grep -qF '/etc/init.d/network reload' "$openwrt_wd_file" 2>/dev/null \
+        && ! grep -qF 'uci commit network' "$openwrt_wd_file" 2>/dev/null; then
+        printf 'verified\n'
+    else
+        printf 'unverified\n'
+    fi
+}
+
 openwrt_parse_prefs() {
     OPENWRT_PREFS_READABLE=no
     OPENWRT_CURRENT_CONTROL_URL=
@@ -433,7 +586,10 @@ openwrt_collect_facts() {
     OPENWRT_TS_STATE=$(openwrt_target_path /etc/tailscale/tailscaled.state)
     OPENWRT_INIT_TAILSCALE=$(openwrt_target_path /etc/init.d/tailscale)
     OPENWRT_INIT_CORE=$(openwrt_target_path /etc/init.d/tailscale-core)
+    OPENWRT_INIT_FAILOVER=$(openwrt_target_path /etc/init.d/tailscale-failover)
+    OPENWRT_WATCHDOG_FAILOVER=$(openwrt_target_path /usr/sbin/tailscale-failover)
     OPENWRT_CONFIG_TAILSCALE=$(openwrt_target_path /etc/config/tailscale)
+    OPENWRT_CONFIG_BOOTSTRAP=$(openwrt_target_path /etc/config/tailscale-bootstrap)
     OPENWRT_CONFIG_FIREWALL=$(openwrt_target_path /etc/config/firewall)
     OPENWRT_CONFIG_NETWORK=$(openwrt_target_path /etc/config/network)
     OPENWRT_HELPER=$(openwrt_target_path /usr/sbin/tailscale_helper)
@@ -449,6 +605,12 @@ openwrt_collect_facts() {
     OPENWRT_INIT_CORE_PRESENT=no
     [ -f "$OPENWRT_INIT_CORE" ] && OPENWRT_INIT_CORE_PRESENT=yes
     OPENWRT_CORE_FINGERPRINT=$(openwrt_core_fingerprint "$OPENWRT_INIT_CORE")
+    OPENWRT_INIT_FAILOVER_PRESENT=no
+    [ -f "$OPENWRT_INIT_FAILOVER" ] && OPENWRT_INIT_FAILOVER_PRESENT=yes
+    OPENWRT_FAILOVER_FINGERPRINT=$(openwrt_failover_fingerprint "$OPENWRT_INIT_FAILOVER")
+    OPENWRT_WATCHDOG_FAILOVER_PRESENT=no
+    [ -f "$OPENWRT_WATCHDOG_FAILOVER" ] && OPENWRT_WATCHDOG_FAILOVER_PRESENT=yes
+    OPENWRT_WATCHDOG_FINGERPRINT=$(openwrt_watchdog_fingerprint "$OPENWRT_WATCHDOG_FAILOVER")
     OPENWRT_STOCK_INIT_PRESENT=no
     [ -f "$OPENWRT_INIT_TAILSCALE" ] && OPENWRT_STOCK_INIT_PRESENT=yes
     OPENWRT_HELPER_PRESENT=no
@@ -528,7 +690,14 @@ openwrt_collect_facts() {
         else
             OPENWRT_CORE_SERVICE_ENABLED=no
         fi
+        if find "$OPENWRT_RC_DIR" \( -type l -o -type f \) -print 2>/dev/null | grep -q '/S[0-9][0-9]tailscale-failover$'; then
+            OPENWRT_FAILOVER_SERVICE_ENABLED=yes
+        else
+            OPENWRT_FAILOVER_SERVICE_ENABLED=no
+        fi
     fi
+
+    openwrt_load_profiles
 
     OPENWRT_CONFIG_LOGIN_SERVER=
     if [ "$OPENWRT_TAILSCALE_CONFIG_PRESENT" = yes ]; then
@@ -629,6 +798,9 @@ openwrt_print_text_discover() {
     printf '  UCI sections network.tailscale/firewall.tailscale/ts_to_lan/ts_wan_udp: %s/%s/%s/%s\n' \
         "$OPENWRT_NETWORK_TS_PRESENT" "$OPENWRT_FIREWALL_TS_PRESENT" "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
     printf '  UDP %s: %s\n' "$OPENWRT_TS_PORT" "$OPENWRT_UDP_TS_PORT"
+    printf '  bootstrap profiles: %s (%s)\n' "$OPENWRT_PROFILE_COUNT" "${OPENWRT_PROFILE_URLS:-none}"
+    printf '  failover enabled/service/fingerprint: %s/%s/%s\n' \
+        "$OPENWRT_FAILOVER_ENABLED" "$OPENWRT_INIT_FAILOVER_PRESENT" "$OPENWRT_FAILOVER_FINGERPRINT"
 }
 
 openwrt_print_json_discover() {
@@ -674,6 +846,11 @@ openwrt_print_json_discover() {
     bootstrap_json_field firewall_ts_to_lan "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT"
     bootstrap_json_field firewall_ts_wan_udp "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
     bootstrap_json_field udp_port_state "$OPENWRT_UDP_TS_PORT"
+    bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
+    bootstrap_json_field profiles "${OPENWRT_PROFILE_URLS:-none}"
+    bootstrap_json_field failover_enabled "$OPENWRT_FAILOVER_ENABLED"
+    bootstrap_json_field failover_service "$OPENWRT_INIT_FAILOVER_PRESENT"
+    bootstrap_json_field failover_fingerprint "$OPENWRT_FAILOVER_FINGERPRINT"
     bootstrap_json_end
 }
 
@@ -745,6 +922,23 @@ openwrt_compute_conflicts() {
         openwrt_plan_blocked=1
         openwrt_block_reasons="$openwrt_block_reasons exit-node-or-default-route-risk"
     fi
+    # Failover invariants: a half-installed or tampered watchdog must block
+    # (and be repaired via enable-failover), never run half-configured.
+    if [ "${openwrt_conflicts_skip_failover:-0}" != 1 ] && [ "$OPENWRT_FAILOVER_ENABLED" = yes ]; then
+        if [ "$OPENWRT_INIT_FAILOVER_PRESENT" != yes ]; then
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons failover-service-missing"
+        elif [ "$OPENWRT_FAILOVER_FINGERPRINT" != verified ]; then
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons failover-unverified-fingerprint"
+        elif [ "$OPENWRT_WATCHDOG_FAILOVER_PRESENT" != yes ] || [ "$OPENWRT_WATCHDOG_FINGERPRINT" != verified ]; then
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons failover-watchdog-missing-or-unverified"
+        elif [ "$OPENWRT_PROFILE_COUNT" -lt 2 ]; then
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons failover-under-two-profiles"
+        fi
+    fi
 }
 
 openwrt_plan() {
@@ -759,6 +953,8 @@ openwrt_plan() {
         bootstrap_json_field effective_service_mode "$OPENWRT_EFFECTIVE_SERVICE_MODE"
         bootstrap_json_field login_server "${OPENWRT_EFFECTIVE_LOGIN_SERVER:-unknown}"
         bootstrap_json_field current_control_url "$OPENWRT_CURRENT_CONTROL_URL"
+        bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
+        bootstrap_json_field failover_enabled "$OPENWRT_FAILOVER_ENABLED"
         bootstrap_json_field blocked_reasons "${openwrt_block_reasons# }"
         if [ "$openwrt_plan_blocked" -eq 1 ]; then bootstrap_json_bool_field blocked true; else bootstrap_json_bool_field blocked false; fi
         bootstrap_json_field mutates_system no
@@ -770,6 +966,8 @@ openwrt_plan() {
         printf 'Detected:\n'
         printf '  service requested/effective: %s/%s\n' "$OPENWRT_SERVICE_MODE" "$OPENWRT_EFFECTIVE_SERVICE_MODE"
         printf '  requested/current ControlURL: %s/%s\n' "${OPENWRT_EFFECTIVE_LOGIN_SERVER:-unknown}" "$OPENWRT_CURRENT_CONTROL_URL"
+        printf '  bootstrap profiles: %s (%s); failover enabled: %s\n' \
+            "$OPENWRT_PROFILE_COUNT" "${OPENWRT_PROFILE_URLS:-none}" "$OPENWRT_FAILOVER_ENABLED"
         printf '  package/tun/fw4/nft: %s/%s/%s/%s\n' "$OPENWRT_TAILSCALE_PACKAGE" "$OPENWRT_TUN_PRESENT" "$OPENWRT_FW4_PRESENT" "$OPENWRT_NFT_PRESENT"
         printf '  dangerous helper: %s (%s)\n' "$OPENWRT_UNSAFE_LUCI_HELPER" "${OPENWRT_UNSAFE_MATCHES# }"
         printf '  existing network.tailscale: %s\n' "$OPENWRT_NETWORK_TS_PRESENT"
@@ -800,6 +998,7 @@ openwrt_plan() {
         printf '\nNever changed by this script:\n'
         printf '  - no tailscale up --reset, no stock init stop/reload/restart, no network reload\n'
         printf '  - no exit node, no IPv6 subnet routing, no DNS changes, no silent ControlURL switch\n'
+        printf '  - failover only switches profiles registered via profile-add; it never logs in\n'
         if [ "$openwrt_plan_blocked" -eq 1 ]; then
             printf '\nBLOCKED: %s\n' "${openwrt_block_reasons# }"
         else
@@ -874,6 +1073,24 @@ openwrt_status() {
         OPENWRT_STATUS_CODE=2
         OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS requested-controlurl-differs"
     fi
+    if [ "$OPENWRT_FAILOVER_ENABLED" = yes ]; then
+        if [ "$OPENWRT_INIT_FAILOVER_PRESENT" != yes ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS failover-service-missing"
+        elif [ "$OPENWRT_FAILOVER_FINGERPRINT" != verified ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS failover-unverified-fingerprint"
+        elif [ "$OPENWRT_WATCHDOG_FAILOVER_PRESENT" != yes ] || [ "$OPENWRT_WATCHDOG_FINGERPRINT" != verified ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS failover-watchdog-missing-or-unverified"
+        elif [ "$OPENWRT_PROFILE_COUNT" -lt 2 ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS failover-under-two-profiles"
+        elif [ "$OPENWRT_FAILOVER_SERVICE_ENABLED" != yes ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS failover-service-not-enabled-at-boot"
+        fi
+    fi
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -887,6 +1104,10 @@ openwrt_status() {
         bootstrap_json_field core_service "$OPENWRT_INIT_CORE_PRESENT"
         bootstrap_json_field network_changes "$OPENWRT_CURRENT_NETWORK_CHANGES"
         bootstrap_json_field firewall_changes "$OPENWRT_CURRENT_FIREWALL_CHANGES"
+        bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
+        bootstrap_json_field profiles "${OPENWRT_PROFILE_URLS:-none}"
+        bootstrap_json_field failover_enabled "$OPENWRT_FAILOVER_ENABLED"
+        bootstrap_json_field failover_service "$OPENWRT_INIT_FAILOVER_PRESENT"
         bootstrap_json_field reasons "${OPENWRT_STATUS_REASONS# }"
         if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then bootstrap_json_bool_field ok true; else bootstrap_json_bool_field ok false; fi
         bootstrap_json_end
@@ -900,6 +1121,8 @@ openwrt_status() {
         printf '  stock init enabled: %s; unsafe helper: %s\n' "$OPENWRT_STOCK_SERVICE_ENABLED" "$OPENWRT_UNSAFE_LUCI_HELPER"
         printf '  network/firewall UCI pending: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
         printf '  exit-node risk: %s\n' "$OPENWRT_EXIT_NODE_RISK"
+        printf '  bootstrap profiles: %s (%s); failover: %s (service %s)\n' \
+            "$OPENWRT_PROFILE_COUNT" "${OPENWRT_PROFILE_URLS:-none}" "$OPENWRT_FAILOVER_ENABLED" "$OPENWRT_INIT_FAILOVER_PRESENT"
         if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then printf 'OK\n'; else printf 'FAIL: %s\n' "${OPENWRT_STATUS_REASONS# }"; fi
     fi
 
@@ -965,6 +1188,12 @@ openwrt_main() {
         install) openwrt_install ;;
         apply) openwrt_apply ;;
         join) openwrt_join ;;
+        profile-list) openwrt_profile_list ;;
+        profile-add) openwrt_profile_add ;;
+        profile-remove) openwrt_profile_remove ;;
+        switch-to) openwrt_switch_to ;;
+        enable-failover) openwrt_enable_failover ;;
+        disable-failover) openwrt_disable_failover ;;
         enable-subnet) openwrt_enable_subnet ;;
         disable-subnet) openwrt_disable_subnet ;;
         allow-wan-udp) openwrt_allow_wan_udp ;;

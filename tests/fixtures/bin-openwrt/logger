@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fake logger: records syslog intent into FAKE_LOG instead of the real syslog.
+
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'logger %s\n' "$*" >> "$LOG"
+exit 0

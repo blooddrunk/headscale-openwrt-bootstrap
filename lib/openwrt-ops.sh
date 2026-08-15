@@ -240,11 +240,14 @@ openwrt_ensure_daemon_running() {
 }
 
 openwrt_write_state() {
+    openwrt_load_profiles
     state_write "$(state_path_openwrt)" \
         service_mode "$OPENWRT_EFFECTIVE_SERVICE_MODE" \
         login_server "$OPENWRT_EFFECTIVE_LOGIN_SERVER" \
         subnets "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}" \
-        firewall_zone tailscale || die 'failed to write state.json'
+        firewall_zone tailscale \
+        profiles "${OPENWRT_PROFILE_URLS:-none}" \
+        failover_enabled "$OPENWRT_FAILOVER_ENABLED" || die 'failed to write state.json'
     log_change "state.json updated: $(state_path_openwrt)"
 }
 
@@ -529,7 +532,642 @@ openwrt_allow_wan_udp() {
     fi
 }
 
-# --- update / rollback / cleanup / purge -----------------------------------
+# --- profiles & failover -----------------------------------------------------
+
+# Profile list + failover settings live in a dedicated, project-owned UCI file
+# (/etc/config/tailscale-bootstrap).  The stock /etc/config/tailscale belongs
+# to luci-app-tailscale and is never written by this script.
+OPENWRT_UCI_TSBOOT=tailscale-bootstrap
+
+openwrt_load_profiles() {
+    # Sets OPENWRT_PROFILES (one "section|url|priority|ts_profile|ts_id" line
+    # each, sorted by priority then section), OPENWRT_PROFILE_COUNT,
+    # OPENWRT_PROFILE_URLS, and OPENWRT_FAILOVER_* settings read from the
+    # committed file.  Only committed state is read; writers always commit.
+    OPENWRT_PROFILES=
+    OPENWRT_PROFILE_COUNT=0
+    OPENWRT_PROFILE_URLS=
+    OPENWRT_FAILOVER_ENABLED=no
+    OPENWRT_FAILOVER_INTERVAL=
+    OPENWRT_FAILOVER_FAILURE_THRESHOLD=
+    OPENWRT_FAILOVER_RECOVERY_THRESHOLD=
+    OPENWRT_FAILOVER_FAILBACK=
+    OPENWRT_FAILOVER_COOLDOWN=
+    OPENWRT_FAILOVER_PROBE_TIMEOUT=
+    OPENWRT_FAILOVER_HEALTH_PATH=
+    [ -r "$OPENWRT_CONFIG_BOOTSTRAP" ] || return 0
+
+    openwrt_lp_settings=
+    while IFS= read -r openwrt_lp_line; do
+        case "$openwrt_lp_line" in
+            setting:*)
+                openwrt_lp_key=${openwrt_lp_line#setting:}
+                openwrt_lp_key=${openwrt_lp_key%%=*}
+                openwrt_lp_value=${openwrt_lp_line#*=}
+                case "$openwrt_lp_key" in
+                    enabled) [ "$openwrt_lp_value" = 1 ] && OPENWRT_FAILOVER_ENABLED=yes ;;
+                    check_interval) OPENWRT_FAILOVER_INTERVAL=$openwrt_lp_value ;;
+                    failure_threshold) OPENWRT_FAILOVER_FAILURE_THRESHOLD=$openwrt_lp_value ;;
+                    recovery_threshold) OPENWRT_FAILOVER_RECOVERY_THRESHOLD=$openwrt_lp_value ;;
+                    failback) OPENWRT_FAILOVER_FAILBACK=$openwrt_lp_value ;;
+                    cooldown) OPENWRT_FAILOVER_COOLDOWN=$openwrt_lp_value ;;
+                    probe_timeout) OPENWRT_FAILOVER_PROBE_TIMEOUT=$openwrt_lp_value ;;
+                    health_path) OPENWRT_FAILOVER_HEALTH_PATH=$openwrt_lp_value ;;
+                esac
+                ;;
+            *)
+                OPENWRT_PROFILES="$OPENWRT_PROFILES$openwrt_lp_line
+"
+                openwrt_lp_url=$(printf '%s\n' "$openwrt_lp_line" | cut -d'|' -f2)
+                OPENWRT_PROFILE_URLS="$OPENWRT_PROFILE_URLS $openwrt_lp_url"
+                OPENWRT_PROFILE_COUNT=$((OPENWRT_PROFILE_COUNT + 1))
+                ;;
+        esac
+    done <<EOF
+$(awk '
+    function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+    function flush() {
+        if (type == "profile" && url != "" && prof != "") {
+            printf "%s|%s|%d|%s|%s\n", name, url, prio + 0, prof, pid
+        }
+    }
+    $1 == "config" {
+        flush()
+        type = unq($2); name = unq($3)
+        url = ""; prio = ""; prof = ""; pid = ""
+        next
+    }
+    type == "profile" && $1 == "option" {
+        k = unq($2)
+        if (k == "login_server") url = unq($3)
+        else if (k == "priority") prio = unq($3)
+        else if (k == "ts_profile") prof = unq($3)
+        else if (k == "ts_id") pid = unq($3)
+        next
+    }
+    type == "failover" && $1 == "option" {
+        print "setting:" unq($2) "=" unq($3)
+        next
+    }
+    END { flush() }
+' "$OPENWRT_CONFIG_BOOTSTRAP" | sort -t'|' -k3,3n -k1,1)
+EOF
+    OPENWRT_PROFILE_URLS=$(printf '%s\n' "$OPENWRT_PROFILE_URLS" | awk '{$1=$1; print}')
+    return 0
+}
+
+openwrt_profiles_find() {
+    # openwrt_profiles_find URL -> section name, or nothing
+    printf '%s\n' "$OPENWRT_PROFILES" | awk -F'|' -v u="$1" '$2 == u { print $1; exit }'
+}
+
+openwrt_profiles_get_field() {
+    # openwrt_profiles_get_field URL FIELD(2=prio,4=ts_profile,5=ts_id) -> value
+    printf '%s\n' "$OPENWRT_PROFILES" | awk -F'|' -v u="$1" -v f="$2" '$2 == u { print $f; exit }'
+}
+
+openwrt_profile_max_priority() {
+    printf '%s\n' "$OPENWRT_PROFILES" | awk -F'|' 'NR == 1 { max = $3 + 0 } $3 + 0 > max { max = $3 + 0 } END { print max + 0 }'
+}
+
+openwrt_profile_section_name() {
+    # Deterministic section name from the URL host.
+    openwrt_psn_host=${1#*://}
+    openwrt_psn_host=${openwrt_psn_host%%/*}
+    printf '%s\n' "$openwrt_psn_host" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/^_\+//; s/_\+$//' | cut -c1-60
+}
+
+# tailscale switch --list entry helpers.  Lines look like
+# "ID Tailnet Account" (newer clients) or "account@example.com", with the
+# current entry marked by a trailing asterisk.
+
+openwrt_ts_current_entry() {
+    printf '%s\n' "$1" | awk '$0 ~ /\*[[:space:]]*$/ { print; exit }'
+}
+
+openwrt_ts_entry_fields() {
+    # openwrt_ts_entry_fields LINE -> "name|id" (id may be empty)
+    printf '%s\n' "$1" | awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
+            n = split(line, f, /[[:space:]]+/)
+            if (n == 0 || line == "") exit
+            print f[n] "|" ((n >= 3) ? f[1] : "")
+        }'
+}
+
+openwrt_ts_new_entry() {
+    # openwrt_ts_new_entry BEFORE AFTER -> the first line only in AFTER.
+    # Lines are normalized first: the only difference between "current" and
+    # "not current" is a trailing asterisk, which must not look like a new
+    # profile.
+    openwrt_tne_before=$(printf '%s\n' "$1" | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//' | awk 'NF')
+    while IFS= read -r openwrt_tne_line; do
+        [ -n "$openwrt_tne_line" ] || continue
+        openwrt_tne_line=$(printf '%s\n' "$openwrt_tne_line" | sed -e 's/[[:space:]]*\*[[:space:]]*$//' -e 's/^[[:space:]]*//')
+        [ -n "$openwrt_tne_line" ] || continue
+        if ! printf '%s\n' "$openwrt_tne_before" | grep -qxF -- "$openwrt_tne_line"; then
+            printf '%s\n' "$openwrt_tne_line"
+            return 0
+        fi
+    done <<EOF
+$2
+EOF
+    return 1
+}
+
+openwrt_ts_entry_for_url() {
+    # openwrt_ts_entry_for_url LIST URL -> entry whose Tailnet column is the
+    # URL host; falls back to the only entry when the list has exactly one.
+    openwrt_tef_host=${2#*://}
+    openwrt_tef_host=${openwrt_tef_host%%/*}
+    printf '%s\n' "$1" | awk -v host="$openwrt_tef_host" '
+        {
+            line = $0
+            sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
+            if (split(line, f, /[[:space:]]+/) >= 3 && f[2] == host) { print line; found = 1; exit }
+            lines[++cnt] = line
+        }
+        END { if (!found && cnt == 1) print lines[1] }'
+}
+
+openwrt_ts_entries_strict_for_url() {
+    # openwrt_ts_entries_strict_for_url LIST URL -> every entry whose Tailnet
+    # column is the URL host (no single-entry fallback).
+    openwrt_tes_host=${2#*://}
+    openwrt_tes_host=${openwrt_tes_host%%/*}
+    printf '%s\n' "$1" | awk -v host="$openwrt_tes_host" '
+        {
+            line = $0
+            sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
+            if (split(line, f, /[[:space:]]+/) >= 3 && f[2] == host) print line
+        }'
+}
+
+openwrt_ts_switch() {
+    # openwrt_ts_switch NAME ID; settles so the new ControlURL is observable.
+    openwrt_tsw_name=$1
+    openwrt_tsw_id=$2
+    if ! tailscale switch "$openwrt_tsw_name" >/dev/null 2>&1; then
+        [ -n "$openwrt_tsw_id" ] || return 1
+        tailscale switch --id="$openwrt_tsw_id" >/dev/null 2>&1 || return 1
+    fi
+    openwrt_tsw_settle=${OPENWRT_SWITCH_SETTLE:-5}
+    [ "$openwrt_tsw_settle" -gt 0 ] 2>/dev/null && sleep "$openwrt_tsw_settle"
+    return 0
+}
+
+openwrt_failover_probe_tool() {
+    if bootstrap_command_exists curl; then printf 'curl\n'; return 0; fi
+    if bootstrap_command_exists wget; then printf 'wget\n'; return 0; fi
+    if bootstrap_command_exists uclient-fetch; then printf 'uclient-fetch\n'; return 0; fi
+    return 1
+}
+
+openwrt_failover_probe() {
+    # openwrt_failover_probe URL TIMEOUT (same order as the watchdog)
+    openwrt_fp_url=$1
+    openwrt_fp_timeout=$2
+    if bootstrap_command_exists curl; then
+        curl -fsS -m "$openwrt_fp_timeout" "$openwrt_fp_url" >/dev/null 2>&1
+        return
+    fi
+    if bootstrap_command_exists wget; then
+        wget -q -T "$openwrt_fp_timeout" -O /dev/null "$openwrt_fp_url" >/dev/null 2>&1
+        return
+    fi
+    if bootstrap_command_exists uclient-fetch; then
+        uclient-fetch -q -O /dev/null "$openwrt_fp_url" >/dev/null 2>&1
+        return
+    fi
+    return 1
+}
+
+openwrt_profile_guard() {
+    # Standard hard guards, tolerating an intentionally different target
+    # server (profile-add/switch-to switch networks on purpose).  With
+    # "skip-failover", failover service defects do not block enable-failover
+    # (which is the command that repairs them).
+    openwrt_refresh
+    openwrt_client_version_gate
+    openwrt_pg_target=$OPENWRT_LOGIN_SERVER
+    openwrt_conflicts_skip_failover=0
+    [ "${1:-}" = skip-failover ] && openwrt_conflicts_skip_failover=1
+    if [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] && [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ] && \
+        [ -n "$openwrt_pg_target" ] && [ "$OPENWRT_CURRENT_CONTROL_URL" != "$openwrt_pg_target" ]; then
+        OPENWRT_LOGIN_SERVER=
+        openwrt_effective_values
+    fi
+    openwrt_compute_conflicts mutate
+    openwrt_conflicts_skip_failover=0
+    OPENWRT_LOGIN_SERVER=$openwrt_pg_target
+    openwrt_effective_values
+    if [ "$openwrt_plan_blocked" -eq 1 ]; then
+        log_error "blocked preconditions: ${openwrt_block_reasons# }"
+        exit 2
+    fi
+}
+
+openwrt_deploy_template() {
+    # openwrt_deploy_template SRC DST MODE FINGERPRINT_FN
+    openwrt_dt_src=$1
+    openwrt_dt_dst=$2
+    openwrt_dt_mode=$3
+    openwrt_dt_fingerprint=$4
+    if [ ! -f "$openwrt_dt_dst" ] || [ "$("$openwrt_dt_fingerprint" "$openwrt_dt_dst")" != verified ]; then
+        if [ -f "$openwrt_dt_dst" ]; then
+            OPENWRT_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
+            OPENWRT_BACKUP_ROOT=$(backup_allocate_directory "$(bootstrap_root_path "$OPENWRT_BACKUP_DIR")" "$OPENWRT_BACKUP_TIMESTAMP") || die 'cannot allocate backup directory'
+            chmod 700 "$OPENWRT_BACKUP_ROOT" 2>/dev/null || true
+            backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
+            backup_copy_path "$openwrt_dt_dst" "$OPENWRT_BACKUP_ROOT/source${openwrt_dt_dst#"$BOOTSTRAP_ROOT"}" || die "failed to back up existing $openwrt_dt_dst"
+            backup_finish "$OPENWRT_BACKUP_ROOT" "$OPENWRT_PROGRAM" "$BOOTSTRAP_ROOT" "$OPENWRT_BACKUP_TIMESTAMP" || die 'failed to finalize backup'
+            log_change "backed up existing $openwrt_dt_dst to $OPENWRT_BACKUP_ROOT"
+        fi
+        mkdir -p "$(dirname "$openwrt_dt_dst")"
+        cat "$OPENWRT_SCRIPT_DIR/$openwrt_dt_src" > "$openwrt_dt_dst" || die "failed to write $openwrt_dt_dst"
+        chmod "$openwrt_dt_mode" "$openwrt_dt_dst"
+        log_change "installed ${openwrt_dt_dst##*/} from the verified template"
+    else
+        log_info "${openwrt_dt_dst##*/} present and fingerprint verified"
+    fi
+    [ "$("$openwrt_dt_fingerprint" "$openwrt_dt_dst")" = verified ] || \
+        die "fingerprint mismatch after write: $openwrt_dt_dst"
+    return 0
+}
+
+openwrt_failover_ensure_service() {
+    openwrt_deploy_template \
+        templates/tailscale-failover.init \
+        "$OPENWRT_INIT_FAILOVER" \
+        755 \
+        openwrt_failover_fingerprint
+    openwrt_deploy_template \
+        templates/tailscale-failover.watchdog.sh \
+        "$OPENWRT_WATCHDOG_FAILOVER" \
+        700 \
+        openwrt_watchdog_fingerprint
+    return 0
+}
+
+openwrt_failover_disable_service() {
+    if [ "$OPENWRT_INIT_FAILOVER_PRESENT" = yes ]; then
+        openwrt_init_action tailscale-failover stop
+        openwrt_init_action tailscale-failover disable
+    fi
+    if openwrt_uci_ensure_option "$OPENWRT_UCI_TSBOOT.watchdog.enabled" 0; then
+        uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+    fi
+    return 0
+}
+
+openwrt_profile_list() {
+    openwrt_refresh
+    if [ "$BOOTSTRAP_JSON" = 1 ]; then
+        bootstrap_json_start
+        bootstrap_json_field script "$OPENWRT_PROGRAM"
+        bootstrap_json_field command profile-list
+        bootstrap_json_field config "${OPENWRT_CONFIG_BOOTSTRAP}"
+        bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
+        bootstrap_json_field profiles "${OPENWRT_PROFILE_URLS:-none}"
+        bootstrap_json_field current_control_url "$OPENWRT_CURRENT_CONTROL_URL"
+        bootstrap_json_field failover_enabled "$OPENWRT_FAILOVER_ENABLED"
+        bootstrap_json_field failover_service "$OPENWRT_INIT_FAILOVER_PRESENT"
+        bootstrap_json_end
+        return 0
+    fi
+    printf 'Bootstrap profile list (read-only)\n'
+    printf '  config: %s\n' "$OPENWRT_CONFIG_BOOTSTRAP"
+    printf '  profiles: %s\n' "${OPENWRT_PROFILE_COUNT:-0}"
+    printf '%s\n' "$OPENWRT_PROFILES" | while IFS='|' read -r openwrt_pl_section openwrt_pl_url openwrt_pl_prio openwrt_pl_name openwrt_pl_id; do
+        [ -n "$openwrt_pl_section" ] || continue
+        openwrt_pl_marker=
+        [ "$openwrt_pl_url" = "$OPENWRT_CURRENT_CONTROL_URL" ] && openwrt_pl_marker=' [active]'
+        printf '  prio %-4s %s%s\n' "$openwrt_pl_prio" "$openwrt_pl_url" "$openwrt_pl_marker"
+        printf '         section %s, ts_profile %s%s\n' "$openwrt_pl_section" "$openwrt_pl_name" \
+            "$([ -n "$openwrt_pl_id" ] && printf ", ts_id %s" "$openwrt_pl_id")"
+    done
+    printf '  current ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+    printf '  failover: %s (service %s, interval %ss, failure %s, recovery %s, failback %s, cooldown %ss)\n' \
+        "$OPENWRT_FAILOVER_ENABLED" "$OPENWRT_INIT_FAILOVER_PRESENT" \
+        "${OPENWRT_FAILOVER_INTERVAL:-60}" "${OPENWRT_FAILOVER_FAILURE_THRESHOLD:-3}" \
+        "${OPENWRT_FAILOVER_RECOVERY_THRESHOLD:-3}" \
+        "$([ "$OPENWRT_FAILOVER_FAILBACK" = 1 ] && printf true || printf false)" \
+        "${OPENWRT_FAILOVER_COOLDOWN:-300}"
+    return 0
+}
+
+openwrt_profile_add() {
+    openwrt_require_root_real
+    bootstrap_is_https_url "$OPENWRT_LOGIN_SERVER" || die 'profile-add requires --login-server https://...'
+    [ -n "$OPENWRT_AUTH_KEY_FILE" ] || die 'profile-add requires --auth-key-file FILE (mode 0400/0600)'
+    openwrt_refresh
+    openwrt_client_version_gate
+
+    openwrt_pa_target=$OPENWRT_LOGIN_SERVER
+    openwrt_pa_prev_url=$OPENWRT_CURRENT_CONTROL_URL
+
+    # Duplicate check before any network action.
+    if [ -n "$(openwrt_profiles_find "$openwrt_pa_target")" ]; then
+        die "$openwrt_pa_target is already in the profile list (use switch-to or profile-remove)"
+    fi
+
+    # A different target server is the normal case here, not a conflict.
+    openwrt_profile_guard
+
+    tailscale switch --list >/dev/null 2>&1 || die 'tailscale switch --list failed; this client cannot manage profiles'
+
+    openwrt_pa_before=$(tailscale switch --list 2>/dev/null || :)
+    openwrt_pa_prev_entry=$(openwrt_ts_current_entry "$openwrt_pa_before")
+    openwrt_pa_prev_name=
+    openwrt_pa_prev_id=
+    if [ -n "$openwrt_pa_prev_entry" ]; then
+        openwrt_pa_prev_fields=$(openwrt_ts_entry_fields "$openwrt_pa_prev_entry")
+        openwrt_pa_prev_name=${openwrt_pa_prev_fields%%|*}
+        openwrt_pa_prev_id=${openwrt_pa_prev_fields#*|}
+    fi
+
+    if [ "$openwrt_pa_prev_url" = "$openwrt_pa_target" ]; then
+        # Adopt the current registration instead of logging in again.
+        openwrt_pa_entry=$(openwrt_ts_entry_for_url "$openwrt_pa_before" "$openwrt_pa_target")
+        if [ -z "$openwrt_pa_entry" ]; then
+            die 'cannot map the current registration to a tailscale profile; register this server via profile-add from another network, or purge-identity first'
+        fi
+        log_info "adopting the current registration on $openwrt_pa_target"
+        openwrt_converge_prefs
+    else
+        # tailscale login creates a NEW profile; it never reconfigures the
+        # current one, so the active network is preserved until we switch back.
+        tailscale login \
+            --login-server="$openwrt_pa_target" \
+            --auth-key="file:$OPENWRT_AUTH_KEY_FILE" || {
+            log_error 'tailscale login failed'
+            log_warn "the auth key file was NOT deleted (it may still be usable): $OPENWRT_AUTH_KEY_FILE"
+            exit 1
+        }
+        rm -f "$OPENWRT_AUTH_KEY_FILE"
+        log_change 'auth key file removed after successful login'
+
+        openwrt_refresh
+        [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ] || \
+            die "ControlURL mismatch after login: $OPENWRT_CURRENT_CONTROL_URL"
+        [ "$OPENWRT_TAILSCALE_IP4" != unknown ] && [ -n "$OPENWRT_TAILSCALE_IP4" ] || \
+            die 'no Tailscale IPv4 after login'
+
+        # Converge the safe prefs while the new profile is current.
+        openwrt_converge_prefs
+
+        openwrt_pa_after=$(tailscale switch --list 2>/dev/null || :)
+        openwrt_pa_entry=$(openwrt_ts_new_entry "$openwrt_pa_before" "$openwrt_pa_after")
+        if [ -z "$openwrt_pa_entry" ]; then
+            log_error 'could not identify the new tailscale profile (list unchanged)'
+            log_warn 'the node is now registered on the new network; fix the profile list manually or purge-identity'
+            exit 1
+        fi
+    fi
+
+    openwrt_pa_fields=$(openwrt_ts_entry_fields "$openwrt_pa_entry")
+    openwrt_pa_name=${openwrt_pa_fields%%|*}
+    openwrt_pa_id=${openwrt_pa_fields#*|}
+
+    openwrt_pa_section=$(openwrt_profile_section_name "$openwrt_pa_target")
+    if [ -n "$OPENWRT_PRIORITY" ]; then
+        openwrt_pa_priority=$OPENWRT_PRIORITY
+    else
+        openwrt_pa_priority=$(( $(openwrt_profile_max_priority) + 10 ))
+        [ "$openwrt_pa_priority" -ge 10 ] || openwrt_pa_priority=10
+    fi
+
+    openwrt_uci_ensure_section "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section" profile || true
+    uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.login_server=$openwrt_pa_target" || die 'uci set login_server failed'
+    uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.priority=$openwrt_pa_priority" || die 'uci set priority failed'
+    uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.ts_profile=$openwrt_pa_name" || die 'uci set ts_profile failed'
+    if [ -n "$openwrt_pa_id" ]; then
+        uci set "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.ts_id=$openwrt_pa_id" || die 'uci set ts_id failed'
+    else
+        openwrt_uci_delete_if_exists "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.ts_id" || true
+    fi
+    uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+    uci -q get "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.login_server" >/dev/null 2>&1 || \
+        die 'profile section missing after commit'
+    log_change "profile recorded: $openwrt_pa_target (section $openwrt_pa_section, priority $openwrt_pa_priority, ts_profile $openwrt_pa_name)"
+
+    # Switch back so adding a backup never yanks the active network away.
+    if [ -n "$openwrt_pa_prev_url" ] && [ "$openwrt_pa_prev_url" != unknown ] && \
+        [ "$openwrt_pa_prev_url" != "$openwrt_pa_target" ] && [ -n "$openwrt_pa_prev_name" ]; then
+        if openwrt_ts_switch "$openwrt_pa_prev_name" "$openwrt_pa_prev_id"; then
+            openwrt_refresh
+            if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_prev_url" ]; then
+                log_change "switched back to $openwrt_pa_prev_url"
+            else
+                log_warn "switch-back verification mismatch: $OPENWRT_CURRENT_CONTROL_URL"
+            fi
+        else
+            log_warn 'switch back to the previous network failed; the node is now on the NEW network'
+        fi
+    fi
+
+    openwrt_refresh
+    openwrt_write_state
+    printf 'Profile added: %s (priority %s, ts_profile %s).\n' "$openwrt_pa_target" "$openwrt_pa_priority" "$openwrt_pa_name"
+    printf 'Active network after profile-add: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+}
+
+openwrt_switch_to() {
+    openwrt_require_root_real
+    bootstrap_is_https_url "$OPENWRT_LOGIN_SERVER" || die 'switch-to requires --login-server https://...'
+    openwrt_refresh
+    openwrt_client_version_gate
+    [ "$OPENWRT_PREFS_READABLE" = yes ] || die 'not registered yet; run profile-add first'
+
+    openwrt_st_target=$OPENWRT_LOGIN_SERVER
+    openwrt_st_section=$(openwrt_profiles_find "$openwrt_st_target")
+    [ -n "$openwrt_st_section" ] || die "$openwrt_st_target is not in the profile list; add it with profile-add first"
+
+    openwrt_profile_guard
+
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_st_target" ]; then
+        openwrt_converge_prefs
+        openwrt_write_state
+        printf 'Already active: %s\n' "$openwrt_st_target"
+        return 0
+    fi
+
+    openwrt_st_name=$(openwrt_profiles_get_field "$openwrt_st_target" 4)
+    openwrt_st_id=$(openwrt_profiles_get_field "$openwrt_st_target" 5)
+    [ -n "$openwrt_st_name" ] || die "profile entry for $openwrt_st_target lacks ts_profile; re-add it via profile-add"
+
+    openwrt_ensure_daemon_running
+    openwrt_ts_switch "$openwrt_st_name" "$openwrt_st_id" || die "tailscale switch to $openwrt_st_name failed"
+
+    openwrt_refresh
+    [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_st_target" ] || \
+        die "switch verification failed: ControlURL=$OPENWRT_CURRENT_CONTROL_URL expected=$openwrt_st_target"
+    openwrt_converge_prefs
+    openwrt_write_state
+    printf 'Switched to: %s (profile %s).\n' "$openwrt_st_target" "$openwrt_st_name"
+}
+
+openwrt_profile_remove() {
+    openwrt_require_root_real
+    openwrt_refresh
+    bootstrap_is_https_url "$OPENWRT_LOGIN_SERVER" || die 'profile-remove requires --login-server https://...'
+    openwrt_pr_target=$OPENWRT_LOGIN_SERVER
+    openwrt_pr_section=$(openwrt_profiles_find "$openwrt_pr_target")
+    if [ -z "$openwrt_pr_section" ]; then
+        log_error "$openwrt_pr_target is not in the profile list; known profiles:${OPENWRT_PROFILE_URLS:- none}"
+        exit 2
+    fi
+
+    openwrt_pr_remaining=$((OPENWRT_PROFILE_COUNT - 1))
+
+    if [ "$OPENWRT_DELETE_IDENTITY" = 1 ]; then
+        [ "$OPENWRT_PREFS_READABLE" = yes ] || die 'not registered; nothing to delete'
+        [ "$openwrt_pr_remaining" -ge 1 ] || die 'refusing --delete-identity: no other profile remains to land on'
+        openwrt_pr_prev_url=$OPENWRT_CURRENT_CONTROL_URL
+        # One URL may own several tailscale profiles (repeated logins);
+        # logout only removes the current one, so loop until none remain.
+        openwrt_pr_attempts=0
+        while :; do
+            openwrt_pr_list=$(tailscale switch --list 2>/dev/null || :)
+            openwrt_pr_entry=$(openwrt_ts_entries_strict_for_url "$openwrt_pr_list" "$openwrt_pr_target" | sed -n '1p')
+            [ -n "$openwrt_pr_entry" ] || break
+            openwrt_pr_attempts=$((openwrt_pr_attempts + 1))
+            [ "$openwrt_pr_attempts" -le 5 ] || \
+                die "could not fully log out $openwrt_pr_target after 5 attempts; finish manually with tailscale switch/logout"
+            openwrt_refresh
+            if [ "$OPENWRT_CURRENT_CONTROL_URL" != "$openwrt_pr_target" ]; then
+                openwrt_pr_fields=$(openwrt_ts_entry_fields "$openwrt_pr_entry")
+                openwrt_pr_name=${openwrt_pr_fields%%|*}
+                openwrt_pr_id=${openwrt_pr_fields#*|}
+                openwrt_ts_switch "$openwrt_pr_name" "$openwrt_pr_id" || \
+                    die "cannot switch to a $openwrt_pr_target profile to log it out"
+            fi
+            tailscale logout || die 'tailscale logout failed'
+        done
+        log_change "identity for $openwrt_pr_target deleted (logged out)"
+
+        openwrt_refresh
+        # Land deterministically on the previous network when it still exists.
+        if [ "$openwrt_pr_prev_url" != "$openwrt_pr_target" ] && \
+            [ -n "$(openwrt_profiles_find "$openwrt_pr_prev_url")" ] && \
+            { [ "$OPENWRT_PREFS_READABLE" != yes ] || [ "$OPENWRT_CURRENT_CONTROL_URL" != "$openwrt_pr_prev_url" ]; }; then
+            openwrt_pr_back_name=$(openwrt_profiles_get_field "$openwrt_pr_prev_url" 4)
+            openwrt_pr_back_id=$(openwrt_profiles_get_field "$openwrt_pr_prev_url" 5)
+            openwrt_ts_switch "$openwrt_pr_back_name" "$openwrt_pr_back_id" || \
+                log_warn "cannot switch back to $openwrt_pr_prev_url after logout"
+            openwrt_refresh
+        fi
+    elif [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pr_target" ]; then
+        log_warn "removing the ACTIVE network; the node stays registered on it until you switch-to another profile"
+    fi
+
+    uci delete "$OPENWRT_UCI_TSBOOT.$openwrt_pr_section" || die "uci delete $openwrt_pr_section failed"
+    uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+    uci -q get "$OPENWRT_UCI_TSBOOT.$openwrt_pr_section.login_server" >/dev/null 2>&1 && \
+        die 'profile section still present after commit'
+    log_change "profile removed from the list: $openwrt_pr_target"
+
+    # A watchdog with fewer than two profiles cannot fail over; disable it.
+    openwrt_refresh
+    if [ "$OPENWRT_FAILOVER_ENABLED" = yes ] && [ "$OPENWRT_PROFILE_COUNT" -lt 2 ]; then
+        openwrt_failover_disable_service
+        log_change 'failover disabled automatically: fewer than two profiles remain'
+        openwrt_refresh
+    fi
+
+    openwrt_write_state
+    printf 'Profile removed: %s (remaining: %s).\n' "$openwrt_pr_target" "$OPENWRT_PROFILE_COUNT"
+    printf 'Active network: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+}
+
+openwrt_enable_failover() {
+    openwrt_require_root_real
+    openwrt_refresh
+    openwrt_client_version_gate
+    openwrt_profile_guard skip-failover
+
+    [ "$OPENWRT_PROFILE_COUNT" -ge 2 ] || die "failover needs at least two profiles; got $OPENWRT_PROFILE_COUNT (profile-add more first)"
+    openwrt_failover_probe_tool >/dev/null || die 'no HTTPS probe tool found (need curl, wget, or uclient-fetch with TLS)'
+
+    openwrt_ef_health=${OPENWRT_HEALTH_PATH:-/health}
+    openwrt_ef_timeout=${OPENWRT_PROBE_TIMEOUT:-5}
+    openwrt_ef_ok=0
+    openwrt_ef_down=
+    while IFS='|' read -r openwrt_ef_section openwrt_ef_url openwrt_ef_prio openwrt_ef_name openwrt_ef_id; do
+        [ -n "$openwrt_ef_section" ] || continue
+        if openwrt_failover_probe "$openwrt_ef_url$openwrt_ef_health" "$openwrt_ef_timeout"; then
+            openwrt_ef_ok=$((openwrt_ef_ok + 1))
+        else
+            openwrt_ef_down="$openwrt_ef_down $openwrt_ef_url"
+        fi
+    done <<EOF
+$OPENWRT_PROFILES
+EOF
+    [ "$openwrt_ef_ok" -ge 1 ] || die 'no profile is reachable right now; refusing to enable a blind watchdog'
+    [ -z "$openwrt_ef_down" ] || log_warn "currently unreachable (excluded until they recover):$openwrt_ef_down"
+
+    # Converge the watchdog settings: explicit flags win, then existing UCI
+    # values, then defaults.
+    openwrt_uci_ensure_section "$OPENWRT_UCI_TSBOOT.watchdog" failover || true
+    openwrt_uci_ensure_option "$OPENWRT_UCI_TSBOOT.watchdog.enabled" 1 || true
+    openwrt_failover_ensure_watchdog_option check_interval "$OPENWRT_CHECK_INTERVAL" 60
+    openwrt_failover_ensure_watchdog_option failure_threshold "$OPENWRT_FAILURE_THRESHOLD" 3
+    openwrt_failover_ensure_watchdog_option recovery_threshold "$OPENWRT_RECOVERY_THRESHOLD" 3
+    openwrt_failover_ensure_watchdog_option cooldown "$OPENWRT_COOLDOWN" 300
+    openwrt_failover_ensure_watchdog_option probe_timeout "$OPENWRT_PROBE_TIMEOUT" 5
+    openwrt_failover_ensure_watchdog_option health_path "$OPENWRT_HEALTH_PATH" /health
+    if [ -n "$OPENWRT_FAILBACK" ]; then
+        case "$OPENWRT_FAILBACK" in
+            true) uci set "$OPENWRT_UCI_TSBOOT.watchdog.failback=1" ;;
+            false) uci set "$OPENWRT_UCI_TSBOOT.watchdog.failback=0" ;;
+        esac
+    fi
+    uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+
+    openwrt_failover_ensure_service
+
+    openwrt_init_action tailscale-failover enable || die 'failed to enable tailscale-failover'
+    openwrt_init_action tailscale-failover start || die 'failed to start tailscale-failover'
+
+    openwrt_refresh
+    [ "$OPENWRT_INIT_FAILOVER_PRESENT" = yes ] || die 'tailscale-failover init missing after enable'
+    [ "$OPENWRT_FAILOVER_FINGERPRINT" = verified ] || die 'tailscale-failover fingerprint unverified after enable'
+    [ "$OPENWRT_WATCHDOG_FINGERPRINT" = verified ] || die 'watchdog fingerprint unverified after enable'
+
+    openwrt_write_state
+    printf 'Failover enabled: %s profiles, watchdog installed and started.\n' "$OPENWRT_PROFILE_COUNT"
+    [ -z "$openwrt_ef_down" ] || printf 'Currently unreachable (excluded until they recover):%s\n' "$openwrt_ef_down"
+    printf 'Logs: logread | grep tailscale-failover; single-cycle check: /usr/sbin/tailscale-failover --once\n'
+}
+
+openwrt_failover_ensure_watchdog_option() {
+    # openwrt_failover_ensure_watchdog_option KEY FLAG_VALUE DEFAULT
+    openwrt_few_key=$1
+    openwrt_few_value=$2
+    openwrt_few_default=$3
+    openwrt_few_path="$OPENWRT_UCI_TSBOOT.watchdog.$openwrt_few_key"
+    if [ -n "$openwrt_few_value" ]; then
+        uci set "$openwrt_few_path=$openwrt_few_value" || die "uci set $openwrt_few_path failed"
+    else
+        uci -q get "$openwrt_few_path" >/dev/null 2>&1 || \
+            uci set "$openwrt_few_path=$openwrt_few_default" || die "uci set $openwrt_few_path failed"
+    fi
+    return 0
+}
+
+openwrt_disable_failover() {
+    openwrt_require_root_real
+    openwrt_refresh
+    openwrt_failover_disable_service
+    openwrt_refresh
+    openwrt_write_state
+    printf 'Failover disabled (service stopped and disabled; profiles kept).\n'
+    return 0
+}
+
 
 openwrt_backup_create() {
     openwrt_refresh
@@ -546,6 +1184,9 @@ openwrt_backup_create() {
     backup_copy_path "$OPENWRT_CONFIG_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/config/tailscale" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
     backup_copy_path "$OPENWRT_CONFIG_FIREWALL" "$OPENWRT_BACKUP_ROOT/source/etc/config/firewall" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
     backup_copy_path "$OPENWRT_CONFIG_NETWORK" "$OPENWRT_BACKUP_ROOT/source/etc/config/network" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
+    backup_copy_path "$OPENWRT_CONFIG_BOOTSTRAP" "$OPENWRT_BACKUP_ROOT/source/etc/config/tailscale-bootstrap" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
+    backup_copy_path "$OPENWRT_INIT_FAILOVER" "$OPENWRT_BACKUP_ROOT/source/etc/init.d/tailscale-failover" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
+    backup_copy_path "$OPENWRT_WATCHDOG_FAILOVER" "$OPENWRT_BACKUP_ROOT/source/usr/sbin/tailscale-failover" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
     mkdir -p "$OPENWRT_BACKUP_ROOT/diagnostics" || { backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"; return 1; }
     openwrt_backup_prefs "$OPENWRT_BACKUP_ROOT/diagnostics/prefs.txt"
     openwrt_backup_packages "$OPENWRT_BACKUP_ROOT/diagnostics/packages.txt"
@@ -641,8 +1282,11 @@ openwrt_rollback() {
         "source/etc/config/firewall:/etc/config/firewall" \
         "source/etc/config/network:/etc/config/network" \
         "source/etc/config/tailscale:/etc/config/tailscale" \
+        "source/etc/config/tailscale-bootstrap:/etc/config/tailscale-bootstrap" \
         "source/etc/init.d/tailscale-core:/etc/init.d/tailscale-core" \
+        "source/etc/init.d/tailscale-failover:/etc/init.d/tailscale-failover" \
         "source/etc/init.d/tailscale:/etc/init.d/tailscale" \
+        "source/usr/sbin/tailscale-failover:/usr/sbin/tailscale-failover" \
         "source/usr/sbin/tailscale_helper:/usr/sbin/tailscale_helper" \
         "source/etc/tailscale:/etc/tailscale"
     do
@@ -655,9 +1299,23 @@ openwrt_rollback() {
 
     uci revert firewall 2>/dev/null || true
     uci revert network 2>/dev/null || true
+    uci revert "$OPENWRT_UCI_TSBOOT" 2>/dev/null || true
     openwrt_init_action firewall reload || log_warn 'firewall reload after restore failed'
     openwrt_init_action tailscale-core enable || die 'failed to re-enable tailscale-core'
     openwrt_init_action tailscale-core start
+
+    # Failover comes back exactly as the snapshot recorded it.
+    openwrt_refresh
+    if [ "$OPENWRT_INIT_FAILOVER_PRESENT" = yes ]; then
+        if [ "$OPENWRT_FAILOVER_ENABLED" = yes ] && [ "$OPENWRT_PROFILE_COUNT" -ge 2 ]; then
+            openwrt_init_action tailscale-failover enable || log_warn 'failed to re-enable tailscale-failover'
+            openwrt_init_action tailscale-failover start || log_warn 'failed to start tailscale-failover'
+        else
+            openwrt_init_action tailscale-failover disable || true
+        fi
+    else
+        rm -f "$(openwrt_target_path /etc/rc.d/S95tailscale-failover)" "$(openwrt_target_path /etc/rc.d/S90tailscale-failover)"
+    fi
 
     openwrt_refresh
     [ -z "$(uci changes network 2>/dev/null)" ] || die 'pending network UCI changes after rollback'
@@ -678,6 +1336,15 @@ openwrt_cleanup() {
     openwrt_init_action tailscale-core disable
     rm -f "$OPENWRT_INIT_CORE" "$(openwrt_target_path /etc/rc.d/S90tailscale-core)"
 
+    # The failover watchdog and the project-owned profile list go away too;
+    # tailscale-side identities inside tailscaled.state are preserved.
+    openwrt_init_action tailscale-failover stop
+    openwrt_init_action tailscale-failover disable
+    rm -f "$OPENWRT_INIT_FAILOVER" "$OPENWRT_WATCHDOG_FAILOVER" \
+        "$(openwrt_target_path /etc/rc.d/S95tailscale-failover)" \
+        "$(openwrt_target_path /etc/rc.d/S90tailscale-failover)" \
+        "$OPENWRT_CONFIG_BOOTSTRAP"
+
     openwrt_c_changed=0
     openwrt_uci_delete_if_exists firewall.ts_to_lan && openwrt_c_changed=1
     openwrt_uci_delete_if_exists firewall.tailscale && openwrt_c_changed=1
@@ -685,8 +1352,8 @@ openwrt_cleanup() {
     openwrt_firewall_commit_or_revert
 
     state_remove "$(state_path_openwrt)"
-    printf 'Cleanup complete: tailscale-core and firewall sections removed; firewall reloaded.\n'
-    printf 'Preserved: /etc/tailscale/tailscaled.state (identity), tailscale and luci-app-tailscale packages.\n'
+    printf 'Cleanup complete: tailscale-core, failover watchdog and firewall sections removed; firewall reloaded.\n'
+    printf 'Preserved: /etc/tailscale/tailscaled.state (identities, incl. all profiles), tailscale and luci-app-tailscale packages.\n'
     printf 'The stock /etc/init.d/tailscale was left untouched (never stopped by this script).\n'
 }
 

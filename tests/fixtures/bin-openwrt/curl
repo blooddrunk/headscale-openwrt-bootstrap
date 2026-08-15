@@ -1,0 +1,26 @@
+#!/bin/sh
+# Fake curl for fixture tests.  Fails when the URL host is listed in
+# FAKE_PROBE_DOWN (space-separated); any other URL succeeds.
+
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'curl %s\n' "$*" >> "$LOG"
+
+url=
+prev=
+for arg in "$@"; do
+    case "$arg" in
+        http://*|https://*) url=$arg ;;
+    esac
+    prev=$arg
+done
+[ -n "$url" ] || exit 1
+
+host=${url#*://}
+host=${host%%/*}
+host=${host%%:*}
+
+case " ${FAKE_PROBE_DOWN:-} " in
+    *" $host "*) printf 'curl: (7) connection refused (fixture)\n' >&2; exit 7 ;;
+esac
+
+exit 0
