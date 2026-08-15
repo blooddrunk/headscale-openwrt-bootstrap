@@ -8,6 +8,10 @@
 
 VPS_DEFAULT_VERSION=0.29.3
 VPS_DEB_URL_PREFIX=https://github.com/juanfont/headscale/releases/download
+# The packaged unit is Type=simple, so "systemctl restart" returns before
+# first-boot initialization (noise key generation, SQLite setup) finishes;
+# a fresh install needs ~2s until /health binds, slower on cold disks.
+VPS_HEALTH_ATTEMPTS=20
 
 vps_require_root_real() {
     if [ "$BOOTSTRAP_ROOT" = / ] && [ "$(id -u 2>/dev/null || printf 1)" != 0 ]; then
@@ -221,6 +225,17 @@ vps_local_health_ok() {
     [ "$(vps_health_code "http://$VPS_LISTEN/health")" = 200 ]
 }
 
+vps_wait_local_health() {
+    # vps_wait_local_health ATTEMPTS — poll /health until it answers 200.
+    vps_wlh_left=$1
+    while [ "$vps_wlh_left" -gt 0 ]; do
+        vps_local_health_ok && return 0
+        vps_wlh_left=$((vps_wlh_left - 1))
+        [ "$vps_wlh_left" -gt 0 ] && sleep 1
+    done
+    return 1
+}
+
 vps_public_health_ok() {
     [ -n "$VPS_EFFECTIVE_DOMAIN" ] || return 1
     [ "$(vps_health_code "https://$VPS_EFFECTIVE_DOMAIN/health")" = 200 ]
@@ -228,8 +243,8 @@ vps_public_health_ok() {
 
 vps_restart_and_verify() {
     systemctl restart headscale || { log_error 'systemctl restart headscale failed'; return 1; }
-    if ! vps_local_health_ok; then
-        log_error 'local /health failed after restart; rolling back config'
+    if ! vps_wait_local_health "$VPS_HEALTH_ATTEMPTS"; then
+        log_error "local /health failed after restart (waited $VPS_HEALTH_ATTEMPTS probes); rolling back config"
         vps_restore_config_backup || log_error 'config rollback failed configtest; keeping new config'
         systemctl restart headscale || true
         return 1
@@ -856,7 +871,7 @@ vps_update_step() {
         return 1
     }
     vps_refresh
-    vps_local_health_ok || {
+    vps_wait_local_health "$VPS_HEALTH_ATTEMPTS" || {
         log_error 'local health failed after update; rolling back to the backup state'
         vps_rollback_to "$VPS_BACKUP_ROOT" || true
         return 1
@@ -996,7 +1011,7 @@ vps_rollback_to() {
     }
     systemctl start headscale || return 1
     vps_refresh
-    vps_local_health_ok || {
+    vps_wait_local_health "$VPS_HEALTH_ATTEMPTS" || {
         log_error 'local health failed after rollback'
         return 1
     }

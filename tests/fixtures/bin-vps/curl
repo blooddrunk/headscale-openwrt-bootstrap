@@ -36,6 +36,20 @@ fi
 
 case "$url" in
     http://127.0.0.1*|http://localhost*)
+        # FAKE_HEALTH_DELAY=N: the first N local /health probes answer 000,
+        # emulating a headscale that is still initializing under a
+        # Type=simple unit.  The counter file survives across the separate
+        # fixture curl processes of one script run.
+        if [ -n "${FAKE_HEALTH_DELAY:-}" ]; then
+            probes_file=${FAKE_VPS_ROOT:-/tmp}/.health-probes
+            probes=$(cat "$probes_file" 2>/dev/null || printf 0)
+            probes=$((probes + 1))
+            printf '%s\n' "$probes" > "$probes_file" 2>/dev/null
+            if [ "$probes" -le "$FAKE_HEALTH_DELAY" ]; then
+                printf '000\n'
+                exit 0
+            fi
+        fi
         printf '%s\n' "${FAKE_LOCAL_HEALTH:-200}"
         ;;
     https://*)

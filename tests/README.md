@@ -29,7 +29,10 @@ committed config still passes `fw4 check`), `FAKE_FAIL_OPENRESTY_T=1`,
 `FAKE_FAIL_AUTH=1`, `FAKE_FAIL_TS_UP=1`, `FAKE_FAIL_TS_LOGIN=1`,
 `FAKE_FAIL_TS_SWITCH=1`, `FAKE_PROBE_DOWN="host1 host2"` (fake curl
 probe failures for the failover watchdog), `FAKE_MISMATCH_DEB=1`,
-`FAKE_LOCAL_HEALTH=503`, `FAKE_RELEASE_TAGS="..."`.
+`FAKE_LOCAL_HEALTH=503`, `FAKE_RELEASE_TAGS="..."`,
+`FAKE_HEALTH_DELAY=N` (the first N local /health probes answer 000,
+emulating a headscale still initializing; the fixture `sleep` is a
+no-op, so polling retry windows cost no test time).
 
 The fake `tailscale` keeps a profile database (`$FAKE_OPENWRT_ROOT/.ts-state/
 profiles`, one `id|tailnet|name|controlurl` line each) and emulates

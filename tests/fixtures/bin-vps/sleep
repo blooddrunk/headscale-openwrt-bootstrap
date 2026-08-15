@@ -1,0 +1,6 @@
+#!/bin/sh
+# Fixture sleep: instant, so health-poll retry windows cost no wall time.
+
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'sleep %s\n' "$*" >> "$LOG"
+exit 0

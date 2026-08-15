@@ -110,6 +110,15 @@ OUT=$(expect_fail 1 env FAKE_SS_EMPTY=1 FAKE_MISMATCH_DEB=1 FAKE_VPS_ROOT="$VROO
 assert_contains "$OUT" 'metadata mismatch'
 if grep -qF 'apt-get install' "$VLOG"; then fail 'apt-get must not run after metadata mismatch'; fi
 
+# 3b. Slow headscale startup: the first /health probes miss while the
+#     service initializes (Type=simple returns before the port binds);
+#     the retry window must converge and install must still succeed.
+make_vps_root vps-fi3b
+OUT=$(env FAKE_SS_EMPTY=1 FAKE_HEALTH_DELAY=2 FAKE_VPS_ROOT="$VROOT" \
+    FAKE_LOG="$VLOG" PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VROOT" \
+    --domain hs.example.com --expected-public-ip 203.0.113.10 install)
+assert_contains "$OUT" 'Installed headscale'
+
 # 4. configtest failure during apply -> no restart, config untouched.
 #    (Drift is introduced on an unmanaged key so the domain-switch guard is
 #    not the thing under test here.)
