@@ -1,3 +1,47 @@
 #!/bin/sh
-printf '200\n'
+# Fixture curl: download URLs to a file, or answer health probes with a code.
 
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'curl %s\n' "$*" >> "$LOG"
+
+url=
+out=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|--output) out=$2; shift 2 ;;
+        --write-out) shift 2 ;;
+        -*) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+
+if [ -n "$out" ] && [ "$out" != /dev/null ]; then
+    case "$url" in
+        https://github.com/juanfont/headscale/releases/download/*)
+            deb_name=${url##*/}
+            deb_version=$(printf '%s\n' "$deb_name" | sed -n 's/^headscale_\([0-9][0-9.]*\)_linux_.*/\1/p')
+            [ "${FAKE_MISMATCH_DEB:-0}" = 1 ] && deb_version=9.9.9
+            printf 'FAKEDEB %s\n' "$deb_version" > "$out"
+            ;;
+        https://api.github.com/repos/juanfont/headscale/releases*)
+            printf '%s\n' "${FAKE_RELEASE_TAGS:-v0.29.3 v0.29.0 v0.28.4 v0.28.0 v0.27.4 v0.27.0 v0.26.1}" |
+                awk '{ for (i = 1; i <= NF; i++) printf "{\"tag_name\":\"%s\",\"prerelease\":false}", $i }' > "$out"
+            ;;
+        *)
+            printf 'FAKEBODY\n' > "$out"
+            ;;
+    esac
+    exit 0
+fi
+
+case "$url" in
+    http://127.0.0.1*|http://localhost*)
+        printf '%s\n' "${FAKE_LOCAL_HEALTH:-200}"
+        ;;
+    https://*)
+        printf '%s\n' "${FAKE_PUBLIC_HEALTH:-200}"
+        ;;
+    *)
+        printf '%s\n' "${FAKE_HTTP_CODE:-200}"
+        ;;
+esac

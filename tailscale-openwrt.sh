@@ -2,10 +2,12 @@
 
 # Headscale + OpenWrt bootstrap, router side.
 #
-# Milestone 1 is deliberately inspection-first.  discover, plan and status do
-# not invoke any init script, do not call network reload, and do not write UCI.
-# backup creates a private snapshot only.  Mutating commands remain fail-closed
-# until the later Milestones implement their transaction/rollback phases.
+# discover/plan/status/verify stay read-only.  install/apply/join and the
+# subnet/WAN-UDP/update/rollback/cleanup commands follow the PLAN section 36
+# transaction model and the ownership boundaries: netifd never manages
+# tailscale0, the dangerous stock init is only ever disabled (never stopped),
+# firewall writes go pending-UCI -> fw4 check -> commit -> firewall reload,
+# and the identity file is never printed.
 
 set -f
 umask 077
@@ -15,9 +17,13 @@ OPENWRT_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P) || exit
 . "$OPENWRT_SCRIPT_DIR/lib/common.sh" || exit 1
 . "$OPENWRT_SCRIPT_DIR/lib/backup.sh" || exit 1
 . "$OPENWRT_SCRIPT_DIR/lib/version.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/state.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/net.sh" || exit 1
+. "$OPENWRT_SCRIPT_DIR/lib/openwrt-ops.sh" || exit 1
 
 OPENWRT_PROGRAM=tailscale-openwrt.sh
 OPENWRT_COMMAND=
+OPENWRT_POSITIONAL=
 OPENWRT_LOGIN_SERVER=
 OPENWRT_AUTH_KEY_FILE=
 OPENWRT_HOSTNAME=
@@ -25,12 +31,16 @@ OPENWRT_SERVICE_MODE=auto
 OPENWRT_ACCEPT_DNS=false
 OPENWRT_ACCEPT_ROUTES=false
 OPENWRT_SUBNET=
+OPENWRT_SUBNET_EXPLICIT=0
 OPENWRT_ENABLE_SUBNET=false
 OPENWRT_ALLOW_WAN_UDP=false
+OPENWRT_ALLOW_WAN_UDP_EXPLICIT=0
+OPENWRT_MIN_CLIENT_VERSION=
 OPENWRT_BACKUP_DIR=/root/tailscale-bootstrap-backups
 BOOTSTRAP_ROOT=/
 BOOTSTRAP_DRY_RUN=0
 BOOTSTRAP_YES=0
+BOOTSTRAP_UNDERSTAND=0
 BOOTSTRAP_JSON=0
 BOOTSTRAP_QUIET=0
 BOOTSTRAP_VERBOSE=0
@@ -38,18 +48,33 @@ BOOTSTRAP_VERBOSE=0
 openwrt_usage() {
     cat <<'EOF'
 Usage:
-  tailscale-openwrt.sh [global options] <command>
+  tailscale-openwrt.sh [global options] <command> [BACKUP_ID]
 
-Milestone 1 commands (discover/status/plan are read-only):
+Read-only commands:
   discover                 Inspect packages, helpers, prefs, UCI and fw4 safely.
-  plan                     Show a guarded future plan; never changes the router.
+  plan                     Show a guarded plan; hard conflicts exit 2.
   status                   Check current daemon/control/firewall/UCI state.
-  verify                   Read-only verification alias for status in Milestone 1.
+  verify                   Read-only alias for status.
   backup                   Create a private timestamped snapshot; no service stop.
 
-Reserved fail-closed commands:
-  install apply join update enable-subnet disable-subnet allow-wan-udp
-  rollback cleanup purge-identity
+Mutating commands (backup -> validate -> apply -> verify, restore on failure):
+  install                  Install the tailscale package, tailscale-core and
+                           start the daemon (logged out); disables an unsafe
+                           stock service without stopping it.
+  apply                    Idempotent convergence: core service, fw4 zone
+                           bound to device tailscale0, prefs via tailscale set.
+  join                     Register with --login-server using --auth-key-file
+                           (file: key, no --reset); refuses a ControlURL switch.
+  enable-subnet            Advertise --subnet (or the discovered LAN CIDR) and
+                           add IPv4 tailscale->lan forwarding after fw4 check.
+  disable-subnet           Withdraw --subnet and remove the forwarding.
+  allow-wan-udp [false]    Add/remove the narrow WAN UDP input rule.
+  update                   Upgrade the tailscale package; restarts
+                           tailscale-core only and verifies identity kept.
+  rollback [BACKUP_ID]     Restore configs, identity and init scripts.
+  cleanup                  Remove tailscale-core + managed firewall sections;
+                           keep identity and packages; never stops stock service.
+  purge-identity           Destructive: needs --yes-i-understand; backs up first.
 
 Options:
   --login-server URL
@@ -59,22 +84,25 @@ Options:
   --accept-dns true|false
   --accept-routes true|false
   --subnet CIDR
+  --min-client-version X.Y.Z  Refuse to proceed when the installed client is
+                              older than this (value comes from the Headscale
+                              server release notes; never hardcoded).
   --enable-subnet[=true|false]
   --allow-wan-udp[=true|false]
   --root DIR                Test/fixture root; default is /.
   --backup-dir DIR          Backup directory in the selected root namespace.
-  --dry-run                 Accepted for CLI compatibility; all Milestone 1 commands are non-mutating.
-  --yes                     Accepted for future explicit operations; not sufficient for reserved commands.
+  --dry-run                 Accepted for CLI compatibility.
+  --yes                     Accepted for future explicit operations.
+  --yes-i-understand        Required confirmation for purge-identity.
   --json --quiet --verbose
   -h, --help
 
-Hard boundaries in this milestone:
-  - never invoke the stock /etc/init.d/tailscale stop/reload/restart;
-  - never invoke /etc/init.d/network reload;
-  - never run tailscale up --reset;
-  - never write network/firewall UCI or enable exit-node behavior;
-  - never print tailscaled.state or auth-key contents;
-  - simultaneous multi-Headscale support is not claimed.
+Hard boundaries:
+  - no netifd interface for tailscale0 and no network reload, ever;
+  - the stock /etc/init.d/tailscale is only disabled, never stopped/reloaded;
+  - no tailscale up --reset; registered nodes converge via tailscale set;
+  - firewall changes: pending UCI -> fw4 check -> commit -> firewall reload;
+  - no exit node, no IPv6 subnet routing, no simultaneous multi-Headscale.
 EOF
 }
 
@@ -88,15 +116,6 @@ openwrt_parse_bool() {
 
 openwrt_need_value() {
     [ "$#" -ge 2 ] || die "option $1 needs a value"
-}
-
-openwrt_parse_option_bool() {
-    openwrt_bool_arg=$1
-    openwrt_bool_default=$2
-    case "$openwrt_bool_arg" in
-        true|yes|1|on|false|no|0|off) openwrt_parse_bool "$openwrt_bool_arg" ;;
-        *) printf '%s\n' "$openwrt_bool_default" ;;
-    esac
 }
 
 openwrt_validate_options() {
@@ -182,9 +201,16 @@ openwrt_parse_args() {
             --subnet)
                 openwrt_need_value "$@"
                 OPENWRT_SUBNET=$2
+                OPENWRT_SUBNET_EXPLICIT=1
                 shift 2
                 ;;
-            --subnet=*) OPENWRT_SUBNET=${1#*=}; shift ;;
+            --subnet=*) OPENWRT_SUBNET=${1#*=}; OPENWRT_SUBNET_EXPLICIT=1; shift ;;
+            --min-client-version)
+                openwrt_need_value "$@"
+                OPENWRT_MIN_CLIENT_VERSION=$2
+                shift 2
+                ;;
+            --min-client-version=*) OPENWRT_MIN_CLIENT_VERSION=${1#*=}; shift ;;
             --enable-subnet)
                 if [ "$#" -ge 2 ]; then
                     case "$2" in
@@ -201,6 +227,7 @@ openwrt_parse_args() {
                 ;;
             --enable-subnet=*) OPENWRT_ENABLE_SUBNET=$(openwrt_parse_bool "${1#*=}"); shift ;;
             --allow-wan-udp)
+                OPENWRT_ALLOW_WAN_UDP_EXPLICIT=1
                 if [ "$#" -ge 2 ]; then
                     case "$2" in
                         true|yes|1|on|false|no|0|off)
@@ -214,7 +241,7 @@ openwrt_parse_args() {
                     shift
                 fi
                 ;;
-            --allow-wan-udp=*) OPENWRT_ALLOW_WAN_UDP=$(openwrt_parse_bool "${1#*=}"); shift ;;
+            --allow-wan-udp=*) OPENWRT_ALLOW_WAN_UDP_EXPLICIT=1; OPENWRT_ALLOW_WAN_UDP=$(openwrt_parse_bool "${1#*=}"); shift ;;
             --root)
                 openwrt_need_value "$@"
                 BOOTSTRAP_ROOT=$2
@@ -228,13 +255,23 @@ openwrt_parse_args() {
                 ;;
             --backup-dir=*) OPENWRT_BACKUP_DIR=${1#*=}; shift ;;
             --dry-run) BOOTSTRAP_DRY_RUN=1; shift ;;
-            --yes|--yes-i-understand) BOOTSTRAP_YES=1; shift ;;
+            --yes) BOOTSTRAP_YES=1; shift ;;
+            --yes-i-understand) BOOTSTRAP_UNDERSTAND=1; shift ;;
             --json) BOOTSTRAP_JSON=1; shift ;;
             --quiet) BOOTSTRAP_QUIET=1; shift ;;
             --verbose) BOOTSTRAP_VERBOSE=1; shift ;;
             -h|--help) openwrt_usage; exit 0 ;;
             --) shift; while [ "$#" -gt 0 ]; do die "unexpected argument after --: $1"; done ;;
-            *) die "unknown option or command: $1" ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                if [ -n "$OPENWRT_COMMAND" ]; then
+                    [ -z "$OPENWRT_POSITIONAL" ] || die "multiple positional arguments: $OPENWRT_POSITIONAL and $1"
+                    OPENWRT_POSITIONAL=$1
+                    shift
+                else
+                    die "unknown command: $1"
+                fi
+                ;;
         esac
     done
 
@@ -351,8 +388,8 @@ openwrt_parse_prefs() {
     fi
     OPENWRT_EXIT_NODE_ID=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"ExitNodeID"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
     [ -n "$OPENWRT_EXIT_NODE_ID" ] && OPENWRT_EXIT_NODE_RISK=yes
-    if grep -qF "option advertise_exit_node '1'" "$OPENWRT_CONFIG_TAILSCALE" 2>/dev/null || \
-        grep -qF -e '--advertise-exit-node' "$OPENWRT_CONFIG_TAILSCALE" 2>/dev/null; then
+    if bootstrap_active_config_lines "$OPENWRT_CONFIG_TAILSCALE" | grep -qF "option advertise_exit_node '1'" 2>/dev/null || \
+        bootstrap_active_config_lines "$OPENWRT_CONFIG_TAILSCALE" | grep -qF -- '--advertise-exit-node' 2>/dev/null; then
         OPENWRT_EXIT_NODE_RISK=yes
     fi
 
@@ -504,7 +541,7 @@ openwrt_collect_facts() {
 
     OPENWRT_CURRENT_NETWORK_CHANGES=unknown
     OPENWRT_CURRENT_FIREWALL_CHANGES=unknown
-    if bootstrap_command_exists uci && [ "$BOOTSTRAP_ROOT" = / ]; then
+    if bootstrap_command_exists uci; then
         OPENWRT_CURRENT_NETWORK_CHANGES=$(uci changes network 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
         OPENWRT_CURRENT_FIREWALL_CHANGES=$(uci changes firewall 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//')
         [ -n "$OPENWRT_CURRENT_NETWORK_CHANGES" ] || OPENWRT_CURRENT_NETWORK_CHANGES=clean
@@ -515,7 +552,7 @@ openwrt_collect_facts() {
     OPENWRT_FIREWALL_TS_PRESENT=no
     OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=no
     OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=no
-    if [ "$BOOTSTRAP_ROOT" = / ] && bootstrap_command_exists uci; then
+    if bootstrap_command_exists uci; then
         uci -q get network.tailscale >/dev/null 2>&1 && OPENWRT_NETWORK_TS_PRESENT=yes
         uci -q get firewall.tailscale >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_PRESENT=yes
         uci -q get firewall.ts_to_lan >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=yes
@@ -645,9 +682,9 @@ openwrt_print_discover() {
     if [ "$BOOTSTRAP_JSON" = 1 ]; then openwrt_print_json_discover; else openwrt_print_text_discover; fi
 }
 
-openwrt_plan() {
-    openwrt_collect_facts
-    openwrt_effective_values
+openwrt_compute_conflicts() {
+    # Shared hard guards for plan and every mutating command (PLAN 2.2, 33.2).
+    openwrt_conflicts_mode=${1:-plan}
     openwrt_plan_blocked=0
     openwrt_block_reasons=
 
@@ -683,8 +720,14 @@ openwrt_plan() {
         openwrt_block_reasons="$openwrt_block_reasons uci-not-found"
     fi
     if [ "$OPENWRT_EFFECTIVE_SERVICE_MODE" = core ] && [ "$OPENWRT_CORE_FINGERPRINT" = unverified ]; then
-        openwrt_plan_blocked=1
-        openwrt_block_reasons="$openwrt_block_reasons unverified-tailscale-core"
+        # plan reports it; mutating commands repair it from the verified
+        # template instead of blocking (PLAN 28), backing up the file first.
+        if [ "$openwrt_conflicts_mode" = plan ]; then
+            openwrt_plan_blocked=1
+            openwrt_block_reasons="$openwrt_block_reasons unverified-tailscale-core"
+        else
+            log_warn 'tailscale-core fingerprint mismatch; it will be restored from the verified template (with a backup)'
+        fi
     fi
     if [ "$OPENWRT_NETWORK_TS_PRESENT" = yes ]; then
         openwrt_plan_blocked=1
@@ -702,24 +745,12 @@ openwrt_plan() {
         openwrt_plan_blocked=1
         openwrt_block_reasons="$openwrt_block_reasons exit-node-or-default-route-risk"
     fi
-    if [ "$OPENWRT_ENABLE_SUBNET" = true ]; then
-        openwrt_plan_blocked=1
-        openwrt_block_reasons="$openwrt_block_reasons subnet-transaction-not-implemented-in-milestone-1"
-        [ -n "$OPENWRT_SUBNET" ] || {
-            openwrt_plan_blocked=1
-            openwrt_block_reasons="$openwrt_block_reasons subnet-not-specified"
-        }
-        case "$OPENWRT_SUBNET" in
-            100.64.*|fd7a:*)
-                openwrt_plan_blocked=1
-                openwrt_block_reasons="$openwrt_block_reasons subnet-overlaps-tailnet-range"
-                ;;
-        esac
-    fi
-    if [ "$OPENWRT_ALLOW_WAN_UDP" = true ]; then
-        openwrt_plan_blocked=1
-        openwrt_block_reasons="$openwrt_block_reasons wan-udp-transaction-not-implemented-in-milestone-1"
-    fi
+}
+
+openwrt_plan() {
+    openwrt_collect_facts
+    openwrt_effective_values
+    openwrt_compute_conflicts plan
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -745,7 +776,7 @@ openwrt_plan() {
         printf '  pending network/firewall UCI: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
         printf '  exit-node risk: %s; subnet requested: %s/%s; WAN UDP requested: %s\n' \
             "$OPENWRT_EXIT_NODE_RISK" "$OPENWRT_ENABLE_SUBNET" "${OPENWRT_SUBNET:-none}" "$OPENWRT_ALLOW_WAN_UDP"
-        printf '\nWould change in a later Milestone (not now):\n'
+        printf '\nplan itself changes nothing; install/apply/join would:\n'
         if [ "$OPENWRT_TAILSCALE_PACKAGE" = absent ]; then
             printf '  - install only the Tailscale package required by the selected package manager\n'
         fi
@@ -766,13 +797,13 @@ openwrt_plan() {
         else
             printf '  - leave WAN UDP %s closed by default and rely on DERP fallback\n' "$OPENWRT_TS_PORT"
         fi
-        printf '\nWill NOT change in this milestone:\n'
-        printf '  - no tailscale up --reset, no stock init stop/reload/restart, no network reload, no UCI write/commit, no firewall reload\n'
-        printf '  - no exit node, no IPv6 subnet routing, no DNS changes, no identity purge, no silent ControlURL switch\n'
+        printf '\nNever changed by this script:\n'
+        printf '  - no tailscale up --reset, no stock init stop/reload/restart, no network reload\n'
+        printf '  - no exit node, no IPv6 subnet routing, no DNS changes, no silent ControlURL switch\n'
         if [ "$openwrt_plan_blocked" -eq 1 ]; then
             printf '\nBLOCKED: %s\n' "${openwrt_block_reasons# }"
         else
-            printf '\nREADY FOR FUTURE MILESTONE: discovery did not find a hard conflict.\n'
+            printf '\nREADY: no hard conflict found; install/apply/join may proceed.\n'
         fi
     fi
 
@@ -898,68 +929,10 @@ openwrt_backup_prefs() {
 }
 
 openwrt_backup() {
-    openwrt_collect_facts
-    bootstrap_sha256_available || die 'backup requires sha256sum, shasum, or openssl'
     if [ "$BOOTSTRAP_ROOT" = / ] && [ "$(id -u 2>/dev/null || printf 1)" != 0 ]; then
         die 'backup of the real OpenWrt device requires root; use --root DIR only for an explicit fixture'
     fi
-
-    OPENWRT_BACKUP_BASE=$(bootstrap_root_path "$OPENWRT_BACKUP_DIR")
-    OPENWRT_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
-    OPENWRT_BACKUP_ROOT=$(backup_allocate_directory "$OPENWRT_BACKUP_BASE" "$OPENWRT_BACKUP_TIMESTAMP") || die "cannot allocate backup directory below: $OPENWRT_BACKUP_BASE"
-    OPENWRT_BACKUP_ID=${OPENWRT_BACKUP_ROOT##*/}
-    chmod 700 "$OPENWRT_BACKUP_ROOT" 2>/dev/null || true
-    backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-
-    backup_copy_path "$OPENWRT_ETC_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/tailscale" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy /etc/tailscale; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_INIT_CORE" "$OPENWRT_BACKUP_ROOT/source/etc/init.d/tailscale-core" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy tailscale-core; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_INIT_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/init.d/tailscale" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy stock tailscale init; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_HELPER" "$OPENWRT_BACKUP_ROOT/source/usr/sbin/tailscale_helper" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy tailscale helper; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_CONFIG_TAILSCALE" "$OPENWRT_BACKUP_ROOT/source/etc/config/tailscale" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy /etc/config/tailscale; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_CONFIG_FIREWALL" "$OPENWRT_BACKUP_ROOT/source/etc/config/firewall" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy /etc/config/firewall; incomplete backup retained'
-    }
-    backup_copy_path "$OPENWRT_CONFIG_NETWORK" "$OPENWRT_BACKUP_ROOT/source/etc/config/network" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to copy /etc/config/network; incomplete backup retained'
-    }
-
-    mkdir -p "$OPENWRT_BACKUP_ROOT/diagnostics" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to create diagnostics directory; incomplete backup retained'
-    }
-    openwrt_backup_prefs "$OPENWRT_BACKUP_ROOT/diagnostics/prefs.txt"
-    openwrt_backup_packages "$OPENWRT_BACKUP_ROOT/diagnostics/packages.txt"
-    {
-        printf 'control_url=%s\n' "$OPENWRT_CURRENT_CONTROL_URL"
-        printf 'tailscale_ip4=%s\n' "$OPENWRT_TAILSCALE_IP4"
-        printf 'advertise_routes=%s\n' "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
-        printf 'unsafe_helper=%s\n' "$OPENWRT_UNSAFE_LUCI_HELPER"
-        printf 'unsafe_matches=%s\n' "${OPENWRT_UNSAFE_MATCHES# }"
-        printf 'state_file_present=%s\n' "$OPENWRT_STATE_PRESENT"
-    } > "$OPENWRT_BACKUP_ROOT/diagnostics/summary.txt"
-    chmod 600 "$OPENWRT_BACKUP_ROOT/diagnostics/summary.txt" 2>/dev/null || true
-
-    backup_finish "$OPENWRT_BACKUP_ROOT" "$OPENWRT_PROGRAM" "$BOOTSTRAP_ROOT" "$OPENWRT_BACKUP_TIMESTAMP" || {
-        backup_mark_incomplete "$OPENWRT_BACKUP_ROOT"
-        die 'failed to finalize backup manifest; incomplete backup retained'
-    }
+    openwrt_backup_create || die 'backup failed'
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -977,20 +950,29 @@ openwrt_backup() {
     fi
 }
 
-openwrt_reserved_command() {
-    log_error "$OPENWRT_COMMAND is reserved for a later Milestone and is fail-closed in this build"
-    log_error 'No tailscale up, init stop/reload/restart, network reload, UCI, firewall, package, or identity change was attempted'
-    exit 2
-}
-
 openwrt_main() {
     openwrt_parse_args "$@"
+    # The allow-wan-udp command enables the rule by default; the option only
+    # exists to express the explicit false form.
+    if [ "$OPENWRT_COMMAND" = allow-wan-udp ] && [ "$OPENWRT_ALLOW_WAN_UDP_EXPLICIT" != 1 ]; then
+        OPENWRT_ALLOW_WAN_UDP=true
+    fi
     case "$OPENWRT_COMMAND" in
         discover) openwrt_print_discover ;;
         plan) openwrt_plan ;;
         status|verify) openwrt_status ;;
         backup) openwrt_backup ;;
-        *) openwrt_reserved_command ;;
+        install) openwrt_install ;;
+        apply) openwrt_apply ;;
+        join) openwrt_join ;;
+        enable-subnet) openwrt_enable_subnet ;;
+        disable-subnet) openwrt_disable_subnet ;;
+        allow-wan-udp) openwrt_allow_wan_udp ;;
+        update) openwrt_update ;;
+        rollback) openwrt_rollback ;;
+        cleanup) openwrt_cleanup ;;
+        purge-identity) openwrt_purge_identity ;;
+        *) die "unhandled command: $OPENWRT_COMMAND" ;;
     esac
 }
 

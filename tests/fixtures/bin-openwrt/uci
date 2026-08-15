@@ -1,0 +1,283 @@
+#!/bin/sh
+# Minimal uci emulator for fixture tests.
+#
+# Committed state:   $FAKE_OPENWRT_ROOT/etc/config/<config>
+# Pending deltas:    $FAKE_OPENWRT_ROOT/tmp/.uci/<config>
+# Delta line format: <op>|<path>|<value>   op: set-option|set-section|add_list|delete
+# Values are stored unquoted; commit materializes them in UCI file syntax.
+#
+# Supported: get [-q], set, add_list, delete, changes, commit, revert.
+# Named sections only (all sections this project manages are named).
+
+ROOT=${FAKE_OPENWRT_ROOT:-}
+LOG=${FAKE_LOG:-}
+DELTA_DIR=$ROOT/tmp/.uci
+
+quiet=0
+cleaned=
+for arg in "$@"; do
+    case "$arg" in
+        -q) quiet=1 ;;
+        -*) : ;;
+        *) cleaned="$cleaned $arg" ;;
+    esac
+done
+# Fixture input comes from our own scripts/tests and contains no spaces.
+# shellcheck disable=SC2086
+set -- $cleaned
+
+[ -n "$LOG" ] && printf 'uci %s\n' "$*" >> "$LOG"
+
+die_missing() {
+    printf 'uci: entry not found\n' >&2
+    exit 1
+}
+
+unquote() {
+    printf '%s\n' "$1" | sed -e "s/^'//" -e "s/'\$//" -e 's/^"//' -e 's/"$//'
+}
+
+config_of() {
+    printf '%s\n' "${1%%.*}"
+}
+
+config_file() {
+    printf '%s/etc/config/%s\n' "$ROOT" "$(config_of "$1")"
+}
+
+delta_file() {
+    printf '%s/%s\n' "$DELTA_DIR" "$(config_of "$1")"
+}
+
+lookup_committed() {
+    lk_path=$1
+    lk_section=${lk_path#*.}
+    lk_section=${lk_section%%.*}
+    lk_option=${lk_path#*.*.}
+    [ "$lk_option" = "$lk_path" ] && lk_option=
+    awk -v sec="$lk_section" -v opt="$lk_option" '
+        function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+        $1 == "config" {
+            if (unq($3) == sec) {
+                if (opt == "") { print unq($2); found = 1; exit }
+                insec = 1
+            } else {
+                insec = 0
+            }
+            next
+        }
+        insec && opt != "" && $1 == "option" && unq($2) == opt {
+            print unq($3); found = 1; exit
+        }
+        insec && opt != "" && $1 == "list" && unq($2) == opt {
+            items = (items == "") ? unq($3) : items " " unq($3)
+        }
+        END {
+            if (!found && items != "") { print items; found = 1 }
+            exit(found ? 0 : 1)
+        }
+    ' "$(config_file "$lk_path")" 2>/dev/null
+}
+
+cmd_get() {
+    get_path=$1
+    get_delta=$(awk -F"|" -v p="$get_path" '
+        $2 == p { result = $1 "|" $3 }
+        END { if (result != "") print result }
+    ' "$(delta_file "$get_path")" 2>/dev/null)
+    if [ -n "$get_delta" ]; then
+        get_op=${get_delta%%|*}
+        get_value=${get_delta#*|}
+        case "$get_op" in
+            delete) die_missing ;;
+            *) printf '%s\n' "$get_value"; exit 0 ;;
+        esac
+    fi
+    get_result=$(lookup_committed "$get_path") || die_missing
+    [ -n "$get_result" ] || die_missing
+    printf '%s\n' "$get_result"
+    exit 0
+}
+
+cmd_set() {
+    set_path=$1
+    set_value=$(unquote "$2")
+    mkdir -p "$DELTA_DIR"
+    case "$set_path" in
+        *.*.*) printf 'set-option|%s|%s\n' "$set_path" "$set_value" >> "$(delta_file "$set_path")" ;;
+        *.*) printf 'set-section|%s|%s\n' "$set_path" "$set_value" >> "$(delta_file "$set_path")" ;;
+        *) printf 'uci: set needs config.section[.option]\n' >&2; exit 1 ;;
+    esac
+}
+
+cmd_add_list() {
+    al_path=$1
+    al_value=$(unquote "$2")
+    mkdir -p "$DELTA_DIR"
+    printf 'add_list|%s|%s\n' "$al_path" "$al_value" >> "$(delta_file "$al_path")"
+}
+
+cmd_delete() {
+    del_path=$1
+    mkdir -p "$DELTA_DIR"
+    printf 'delete|%s|\n' "$del_path" >> "$(delta_file "$del_path")"
+}
+
+cmd_changes() {
+    changes_config=$1
+    if [ -n "$changes_config" ]; then
+        cat "$DELTA_DIR/$changes_config" 2>/dev/null
+    else
+        cat "$DELTA_DIR"/* 2>/dev/null
+    fi
+    exit 0
+}
+
+apply_set_option() {
+    aso_file=$1; aso_section=$2; aso_option=$3; aso_value=$4
+    awk -v sec="$aso_section" -v opt="$aso_option" -v val="$aso_value" '
+        function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+        function emit_option() { printf "\toption %s \047%s\047\n", opt, val }
+        {
+            if ($1 == "config") {
+                if (insec && !done) { emit_option(); done = 1 }
+                insec = (unq($3) == sec) ? 1 : 0
+                print
+                next
+            }
+            if (insec && $1 == "option" && unq($2) == opt) {
+                if (!done) { emit_option(); done = 1 }
+                next
+            }
+            if (insec && $1 == "list" && unq($2) == opt) next
+            print
+        }
+        END { if (insec && !done) emit_option() }
+    ' "$aso_file" > "$aso_file.tmp" && mv "$aso_file.tmp" "$aso_file"
+}
+
+apply_add_list() {
+    aal_file=$1; aal_section=$2; aal_option=$3; aal_value=$4
+    awk -v sec="$aal_section" -v opt="$aal_option" -v val="$aal_value" '
+        function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+        function emit_item() { printf "\tlist %s \047%s\047\n", opt, val }
+        {
+            if ($1 == "config") {
+                if (insec && !done) { emit_item(); done = 1 }
+                insec = (unq($3) == sec) ? 1 : 0
+                print
+                next
+            }
+            if (insec && $1 == "option" && unq($2) == opt) next
+            if (insec && $1 == "list" && unq($2) == opt && unq($3) == val) done = 1
+            print
+        }
+        END { if (insec && !done) emit_item() }
+    ' "$aal_file" > "$aal_file.tmp" && mv "$aal_file.tmp" "$aal_file"
+}
+
+apply_set_section() {
+    ass_file=$1; ass_section=$2; ass_type=$3
+    if awk -v sec="$ass_section" '
+        function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+        $1 == "config" && unq($3) == sec { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$ass_file" 2>/dev/null; then
+        return 0
+    fi
+    printf "config %s '%s'\n" "$ass_type" "$ass_section" >> "$ass_file"
+}
+
+apply_delete() {
+    ad_file=$1; ad_path=$2
+    case "$ad_path" in
+        *.*.*)
+            ad_section=${ad_path#*.}; ad_section=${ad_section%%.*}
+            ad_option=${ad_path#*.*.}
+            awk -v sec="$ad_section" -v opt="$ad_option" '
+                function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+                {
+                    if ($1 == "config") { insec = (unq($3) == sec) ? 1 : 0; print; next }
+                    if (insec && ($1 == "option" || $1 == "list") && unq($2) == opt) next
+                    print
+                }
+            ' "$ad_file" > "$ad_file.tmp" && mv "$ad_file.tmp" "$ad_file"
+            ;;
+        *.*)
+            ad_section=${ad_path#*.}
+            awk -v sec="$ad_section" '
+                function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+                $1 == "config" { keep = (unq($3) == sec) ? 0 : 1 }
+                keep { print }
+            ' "$ad_file" > "$ad_file.tmp" && mv "$ad_file.tmp" "$ad_file"
+            ;;
+        *) printf 'uci: delete needs config.section[.option]\n' >&2; exit 1 ;;
+    esac
+}
+
+cmd_commit() {
+    commit_config=$1
+    commit_delta=$(delta_file "$commit_config")
+    [ -f "$commit_delta" ] || exit 0
+    commit_target=$(config_file "$commit_config")
+    [ -f "$commit_target" ] || : > "$commit_target"
+    while IFS='|' read -r commit_op commit_path commit_value; do
+        [ -n "$commit_op" ] || continue
+        case "$commit_op" in
+            set-option)
+                commit_section=${commit_path#*.}; commit_section=${commit_section%%.*}
+                commit_option=${commit_path#*.*.}
+                apply_set_option "$commit_target" "$commit_section" "$commit_option" "$commit_value"
+                ;;
+            set-section)
+                commit_section=${commit_path#*.}
+                apply_set_section "$commit_target" "$commit_section" "$commit_value"
+                ;;
+            add_list)
+                commit_section=${commit_path#*.}; commit_section=${commit_section%%.*}
+                commit_option=${commit_path#*.*.}
+                apply_add_list "$commit_target" "$commit_section" "$commit_option" "$commit_value"
+                ;;
+            delete)
+                apply_delete "$commit_target" "$commit_path"
+                ;;
+        esac
+    done < "$commit_delta"
+    rm -f "$commit_delta"
+}
+
+cmd_revert() {
+    revert_config=$1
+    if [ -n "$revert_config" ]; then
+        rm -f "$DELTA_DIR/$revert_config"
+    else
+        rm -f "$DELTA_DIR"/* 2>/dev/null
+    fi
+}
+
+[ $# -ge 1 ] || { printf 'uci: missing command\n' >&2; exit 1; }
+uci_cmd=$1
+shift
+
+case "$uci_cmd" in
+    get) [ $# -ge 1 ] || { printf 'uci: get needs a path\n' >&2; exit 1; }; cmd_get "$1" ;;
+    set)
+        [ $# -ge 1 ] || { printf 'uci: set needs arguments\n' >&2; exit 1; }
+        case "$1" in
+            *=*) cmd_set "${1%%=*}" "${1#*=}" ;;
+            *) [ $# -ge 2 ] && cmd_set "$1" "$(unquote "$2")" ;;
+        esac
+        ;;
+    add_list)
+        case "$1" in
+            *=*) cmd_add_list "${1%%=*}" "${1#*=}" ;;
+            *) [ $# -ge 2 ] && cmd_add_list "$1" "$(unquote "$2")" ;;
+        esac
+        ;;
+    delete) [ $# -ge 1 ] && cmd_delete "$1" ;;
+    changes) cmd_changes "$1" ;;
+    commit) cmd_commit "$1" ;;
+    revert) cmd_revert "$1" ;;
+    *) printf 'uci: unsupported command in fixture: %s\n' "$uci_cmd" >&2; exit 1 ;;
+esac
+exit 0

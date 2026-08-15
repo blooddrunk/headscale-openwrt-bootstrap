@@ -1,0 +1,22 @@
+#!/bin/sh
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'caddy %s\n' "$*" >> "$LOG"
+
+case "$1" in
+    version) printf 'v2.8.4\n' ;;
+    validate)
+        config=
+        prev=
+        for arg in "$@"; do
+            [ "$prev" = "--config" ] && config=$arg
+            prev=$arg
+        done
+        [ "${FAKE_FAIL_CADDY_VALIDATE:-0}" = 1 ] && { printf 'caddy: injected validate failure\n' >&2; exit 1; }
+        if [ -n "$config" ] && grep -q 'BROKEN-CADDYFILE' "$config" 2>/dev/null; then
+            printf 'caddy: broken fixture Caddyfile\n' >&2
+            exit 1
+        fi
+        printf 'Valid configuration\n'
+        ;;
+    *) exit 0 ;;
+esac

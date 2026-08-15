@@ -52,6 +52,7 @@ backup_write_metadata() {
     backup_metadata_script=$2
     backup_metadata_root=$3
     backup_metadata_timestamp=$4
+    backup_metadata_service=${5:-unknown}
 
     umask 077
     {
@@ -60,6 +61,10 @@ backup_write_metadata() {
         printf 'script=%s\n' "$backup_metadata_script"
         printf 'source_root=%s\n' "$backup_metadata_root"
         printf 'created_at_utc=%s\n' "$backup_metadata_timestamp"
+        # yes means the source service was still running while files were
+        # copied: a live SQLite database copied with cp(1) may be internally
+        # inconsistent.  Restores must verify database integrity before use.
+        printf 'service_running=%s\n' "$backup_metadata_service"
         printf 'secret_contents=not_logged\n'
     } > "$backup_metadata_file"
     chmod 600 "$backup_metadata_file" 2>/dev/null || true

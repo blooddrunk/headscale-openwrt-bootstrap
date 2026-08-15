@@ -9,6 +9,9 @@
 *.pem
 *.key
 
+# Test fixtures are inert fakes; allow the fixture identity marker by exact path.
+!tests/fixtures/openwrt/etc/tailscale/tailscaled.state
+
 # Generated private snapshots and test output.
 backups/
 tests/tmp/

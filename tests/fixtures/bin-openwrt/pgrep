@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fixture pgrep: tailscaled is considered not running (fixture namespace
+# never starts real daemons).  FAKE_TAILSCALED_RUNNING=1 flips it.
+[ "${FAKE_TAILSCALED_RUNNING:-0}" = 1 ] && exit 0
+exit 1

@@ -1,0 +1,54 @@
+#!/bin/sh
+# Fixture apt-get.  Installing a local headscale .deb materializes the
+# package payload (default config, data dir, version marker) under
+# $FAKE_VPS_ROOT.  FAKE_FAIL_APT=1 injects failure.
+
+ROOT=${FAKE_VPS_ROOT:-}
+LOG=${FAKE_LOG:-}
+STATE=$ROOT/.headscale-state
+SELF=$0
+if [ -L "$SELF" ]; then
+    SELF=$(readlink "$SELF")
+    case "$SELF" in
+        /*) : ;;
+        *) SELF=$(dirname "$0")/$SELF ;;
+    esac
+fi
+PAYLOAD=${FAKE_PAYLOAD_DIR:-$(dirname "$SELF")/../deb-payload}
+[ -n "$LOG" ] && printf 'apt-get %s\n' "$*" >> "$LOG"
+
+case "$1" in
+    install)
+        [ "${FAKE_FAIL_APT:-0}" = 1 ] && { printf 'apt-get: injected failure\n' >&2; exit 1; }
+        deb_arg=
+        caddy_arg=
+        for arg in "$@"; do
+            case "$arg" in
+                ./*.deb|/*.deb) deb_arg=$arg ;;
+                caddy) caddy_arg=1 ;;
+            esac
+        done
+        if [ -n "$deb_arg" ]; then
+            deb_name=$(basename "$deb_arg")
+            deb_version=$(printf '%s\n' "$deb_name" | sed -n 's/^headscale_\([0-9][0-9.]*\)_linux_.*/\1/p')
+            mkdir -p "$STATE" "$ROOT/etc/headscale" "$ROOT/var/lib/headscale"
+            printf '%s\n' "$deb_version" > "$STATE/version"
+            : > "$ROOT/.headscale-installed"
+            if [ ! -f "$ROOT/etc/headscale/config.yaml" ]; then
+                cp "$PAYLOAD/config.example.yaml" "$ROOT/etc/headscale/config.yaml"
+            fi
+            printf 'headscale %s installed\n' "$deb_version"
+        elif [ -n "$caddy_arg" ]; then
+            mkdir -p "$ROOT/.caddy" "$ROOT/usr/bin"
+            ln -sf "$(dirname "$SELF")/caddy" "$ROOT/usr/bin/caddy" 2>/dev/null || true
+            printf 'caddy fixture installed\n'
+        else
+            printf 'apt-get: nothing to simulate for: %s\n' "$*" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        printf 'apt-get: unsupported fixture operation: %s\n' "$1" >&2
+        exit 1
+        ;;
+esac

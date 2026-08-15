@@ -1,13 +1,58 @@
 #!/bin/sh
+# Fixture opkg: installed-state markers live in $FAKE_OPENWRT_ROOT/.opkg-installed
+# and per-package versions in $FAKE_OPENWRT_ROOT/.opkg-versions.
+
+ROOT=${FAKE_OPENWRT_ROOT:-}
+LOG=${FAKE_LOG:-}
+MARKERS=$ROOT/.opkg-installed
+VERSIONS=$ROOT/.opkg-versions
+[ -n "$LOG" ] && printf 'opkg %s\n' "$*" >> "$LOG"
+
+pkg_version() {
+    if [ -f "$VERSIONS/$1" ]; then
+        cat "$VERSIONS/$1"
+    else
+        case "$1" in
+            tailscale) printf '1.98.3-r1\n' ;;
+            luci-app-tailscale) printf '1.2.6-r1\n' ;;
+        esac
+    fi
+}
+
 case "$1" in
     status)
-        case "$2" in
-            tailscale) printf 'Package: tailscale\nStatus: install ok installed\nVersion: 1.98.3-r1\n' ;;
-            luci-app-tailscale) printf 'Package: luci-app-tailscale\nStatus: install ok installed\nVersion: 1.2.6-r1\n' ;;
-            *) exit 1 ;;
-        esac
+        pkg=$2
+        [ -f "$MARKERS/$pkg" ] || exit 1
+        printf 'Package: %s\nStatus: install ok installed\nVersion: %s\n' "$pkg" "$(pkg_version "$pkg")"
         ;;
-    list-installed) printf 'tailscale - 1.98.3-r1\nluci-app-tailscale - 1.2.6-r1\n' ;;
+    list-installed)
+        [ -d "$MARKERS" ] || exit 0
+        for marker in "$MARKERS"/*; do
+            [ -e "$marker" ] || continue
+            pkg=${marker##*/}
+            printf '%s - %s\n' "$pkg" "$(pkg_version "$pkg")"
+        done
+        ;;
+    update)
+        if [ "${FAKE_FAIL_OPKG:-0}" = 1 ]; then exit 1; fi
+        ;;
+    install)
+        pkg=$2
+        if [ "${FAKE_FAIL_OPKG:-0}" = 1 ]; then exit 1; fi
+        mkdir -p "$MARKERS" "$VERSIONS"
+        : > "$MARKERS/$pkg"
+        printf '%s\n' "${FAKE_OPKG_INSTALL_VERSION:-1.98.3-r1}" > "$VERSIONS/$pkg"
+        ;;
+    upgrade)
+        pkg=$2
+        if [ "${FAKE_FAIL_OPKG:-0}" = 1 ]; then exit 1; fi
+        [ -f "$MARKERS/$pkg" ] || exit 1
+        mkdir -p "$VERSIONS"
+        printf '%s\n' "${FAKE_OPKG_UPGRADE_VERSION:-1.98.4-r1}" > "$VERSIONS/$pkg"
+        ;;
+    remove)
+        pkg=$2
+        rm -f "$MARKERS/$pkg"
+        ;;
     *) exit 0 ;;
 esac
-

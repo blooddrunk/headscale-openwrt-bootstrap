@@ -1,10 +1,28 @@
 #!/bin/sh
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'docker %s\n' "$*" >> "$LOG"
+
 case "$1" in
-    ps) printf '1Panel-openresty\n' ;;
+    ps)
+        [ "${FAKE_NO_DOCKER:-0}" = 1 ] && exit 0
+        printf '1Panel-openresty\n'
+        ;;
     inspect)
+        [ "${FAKE_NO_DOCKER:-0}" = 1 ] && exit 1
         case "$*" in
             *Mounts*) printf '/opt/1panel/www=>/www;/opt/1panel/www/conf.d=>/usr/local/openresty/nginx/conf/conf.d;\n' ;;
             *) printf '/1Panel-openresty|openresty:latest|host\n' ;;
+        esac
+        ;;
+    exec)
+        case "$*" in
+            *'-t'*)
+                [ "${FAKE_FAIL_OPENRESTY_T:-0}" = 1 ] && { printf 'openresty: configuration file test failed\n' >&2; exit 1; }
+                printf 'syntax is ok\n'
+                ;;
+            *'-s reload'*)
+                if [ "${FAKE_FAIL_OPENRESTY_RELOAD:-0}" = 1 ]; then exit 1; fi
+                ;;
         esac
         ;;
     *) exit 1 ;;

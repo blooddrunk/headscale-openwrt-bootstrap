@@ -37,6 +37,16 @@ bootstrap_read_first_line() {
     sed -n '1p' "$bootstrap_read_file" 2>/dev/null
 }
 
+bootstrap_active_config_lines() {
+    # Drop full-line comments only.  Trailing comments stay, so an active
+    # directive with an inline note is still matched.  This keeps grep-based
+    # directive checks from firing on the commented-out defaults that ship in
+    # luci-app-tailscale and generated nginx configs.
+    bootstrap_active_file=$1
+    [ -r "$bootstrap_active_file" ] || return 0
+    sed -e '/^[[:space:]]*#/d' "$bootstrap_active_file" 2>/dev/null
+}
+
 bootstrap_trim() {
     # awk collapses leading/trailing whitespace without evaluating the value.
     printf '%s\n' "$1" | awk '{$1=$1; print}'

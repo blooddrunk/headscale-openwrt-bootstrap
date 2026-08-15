@@ -1,13 +1,27 @@
 #!/bin/sh
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'ss %s\n' "$*" >> "$LOG"
+
+if [ "${FAKE_SS_EMPTY:-0}" = 1 ]; then
+    case "$*" in
+        *-lun*) printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n' ;;
+        *) printf 'Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n' ;;
+    esac
+    exit 0
+fi
+
 case "$*" in
     *-lun*) printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n' ;;
     *)
         printf 'Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n'
         printf 'tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n'
-        printf 'tcp LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'
+        if [ "${FAKE_SS_UNKNOWN_443:-0}" = 1 ]; then
+            printf 'tcp LISTEN 0 128 198.51.100.7:443 0.0.0.0:* users:(("stranger",pid=4242,fd=6))\n'
+        else
+            printf 'tcp LISTEN 0 128 0.0.0.0:443 0.0.0.0:*\n'
+        fi
         printf 'tcp LISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\n'
         printf 'tcp LISTEN 0 128 127.0.0.1:9090 0.0.0.0:*\n'
         printf 'tcp LISTEN 0 128 127.0.0.1:50443 0.0.0.0:*\n'
         ;;
 esac
-

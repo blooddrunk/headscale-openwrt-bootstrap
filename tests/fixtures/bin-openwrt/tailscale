@@ -1,14 +1,126 @@
 #!/bin/sh
-case "$1" in
-    version) printf '1.98.3\n' ;;
-    debug)
-        printf '{"ControlURL":"https://hs.example.com","CorpDNS":false,"RouteAll":false,"AdvertiseRoutes":["192.168.10.0/24"]}\n'
+# Stateful tailscale CLI emulator.  Prefs live in
+# $FAKE_OPENWRT_ROOT/.ts-state/prefs as one line of JSON with the fields the
+# scripts parse (ControlURL, CorpDNS, RouteAll, AdvertiseRoutes, ExitNodeID).
+
+ROOT=${FAKE_OPENWRT_ROOT:-}
+LOG=${FAKE_LOG:-}
+STATE_DIR=$ROOT/.ts-state
+PREFS=$STATE_DIR/prefs
+mkdir -p "$STATE_DIR" 2>/dev/null
+[ -n "$LOG" ] && printf 'tailscale %s\n' "$*" >> "$LOG"
+
+logged_in() { [ -f "$PREFS" ]; }
+
+prefs_get() {
+    sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^,\"}\]*\).*/\1/p" "$PREFS" 2>/dev/null | sed -n '1p'
+}
+
+write_prefs() {
+    if [ -n "$4" ]; then
+        wp_quoted=$(printf '%s\n' "$4" | sed 's/,[[:space:]]*/","/g; s/^/"/; s/$/"/')
+    else
+        wp_quoted=
+    fi
+    printf '{"ControlURL":"%s","CorpDNS":%s,"RouteAll":%s,"AdvertiseRoutes":[%s],"ExitNodeID":""}\n' \
+        "$1" "$2" "$3" "$wp_quoted" > "$PREFS"
+}
+
+up_login_server=https://controlplane.tailscale.com
+up_accept_dns=true
+up_accept_routes=false
+up_auth_key=
+prev=
+for arg in "$@"; do
+    case "$prev" in --login-server) up_login_server=$arg ;; esac
+    case "$prev" in --auth-key) up_auth_key=$arg ;; esac
+    case "$arg" in
+        --login-server=*) up_login_server=${arg#--login-server=} ;;
+        --auth-key=*) up_auth_key=${arg#--auth-key=} ;;
+        --accept-dns=*) up_accept_dns=${arg#--accept-dns=} ;;
+        --accept-routes=*) up_accept_routes=${arg#--accept-routes=} ;;
+    esac
+    prev=$arg
+done
+
+case "$1 $2" in
+    'version '|'version'*)
+        printf '%s\n' "${FAKE_TS_VERSION:-$(cat "$STATE_DIR/version" 2>/dev/null || printf 1.98.3)}"
         ;;
-    status)
-        printf '{"BackendState":"Running"}\n'
+    'debug prefs'|'debug prefs'*)
+        if logged_in; then
+            cat "$PREFS"
+        else
+            printf 'cannot load prefs: not logged in\n' >&2
+            exit 1
+        fi
         ;;
-    ip) printf '100.64.0.1\n' ;;
-    switch) printf 'profile-home\n' ;;
+    'status --json'|'status '*)
+        if [ "$2" = --json ]; then
+            if logged_in; then
+                printf '{"Version":"1.98.3","BackendState":"Running","Self":{"HostName":"kwrt"}}\n'
+            else
+                printf '{"Version":"1.98.3","BackendState":"NeedsLogin","Self":null}\n'
+            fi
+        else
+            if logged_in; then
+                printf '100.64.0.1 kwrt\n'
+            else
+                printf 'Logged out.\n' >&2
+                exit 1
+            fi
+        fi
+        ;;
+    'ip '*)
+        logged_in || exit 1
+        printf '100.64.0.1\n'
+        ;;
+    'switch '*)
+        logged_in || exit 1
+        printf 'profile-home\n'
+        ;;
+    'up '*|'up')
+        printf '%s\n' "$*" | grep -q -- '--reset' && { printf 'fixture refuses --reset\n' >&2; exit 1; }
+        [ "${FAKE_FAIL_TS_UP:-0}" = 1 ] && { printf 'up failed (injected)\n' >&2; exit 1; }
+        case "$up_auth_key" in
+            file:*)
+                key_file=${up_auth_key#file:}
+                [ -f "$key_file" ] || { printf 'invalid auth key: file missing\n' >&2; exit 1; }
+                [ "${FAKE_FAIL_AUTH:-0}" = 1 ] && { printf 'invalid auth key (injected)\n' >&2; exit 1; }
+                ;;
+            '') : ;;
+            *) [ "${FAKE_FAIL_AUTH:-0}" = 1 ] && { printf 'invalid auth key (injected)\n' >&2; exit 1; } ;;
+        esac
+        [ "${FAKE_DIFFERENT_CONTROLURL:-0}" = 1 ] && up_login_server=https://login.tailscale.com
+        write_prefs "$up_login_server" "$up_accept_dns" "$up_accept_routes" ''
+        ;;
+    'set '*)
+        logged_in || { printf 'set: not logged in\n' >&2; exit 1; }
+        [ "${FAKE_FAIL_TS_SET:-0}" = 1 ] && { printf 'set failed (injected)\n' >&2; exit 1; }
+        cur_url=$(prefs_get ControlURL)
+        cur_dns=$(prefs_get CorpDNS)
+        cur_routes=$(prefs_get RouteAll)
+        cur_advertised=$(sed -n 's/.*"AdvertiseRoutes":\[\([^]]*\)\].*/\1/p' "$PREFS")
+        new_dns=$cur_dns
+        new_routes=$cur_routes
+        new_advertised=$cur_advertised
+        for arg in "$@"; do
+            case "$arg" in
+                --accept-dns=*) new_dns=${arg#--accept-dns=} ;;
+                --accept-routes=*) new_routes=${arg#--accept-routes=} ;;
+                --advertise-routes=*) new_advertised=${arg#--advertise-routes=} ;;
+            esac
+        done
+        write_prefs "$cur_url" "$new_dns" "$new_routes" "$new_advertised"
+        ;;
+    logout)
+        rm -f "$PREFS"
+        ;;
+    netcheck)
+        printf 'DERP relay "tok"\n'
+        ;;
+    ping)
+        printf 'pong from via DERP(tok)\n'
+        ;;
     *) exit 0 ;;
 esac
-

@@ -1,7 +1,51 @@
 #!/bin/sh
-case "$1" in
-    is-active) printf 'active\n' ;;
-    is-enabled) printf 'enabled\n' ;;
+# Stateful systemctl emulator.  State lives in $FAKE_VPS_ROOT/.systemd/
+# as <unit>.active and <unit>.enabled markers so is-active/is-enabled reflect
+# prior enable/disable/start/stop/restart calls.
+
+ROOT=${FAKE_VPS_ROOT:-}
+LOG=${FAKE_LOG:-}
+STATE_DIR=$ROOT/.systemd
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+[ -n "$LOG" ] && printf 'systemctl %s\n' "$*" >> "$LOG"
+
+unit=headscale
+cmd=
+for arg in "$@"; do
+    case "$arg" in
+        -*) : ;;
+        *) if [ -z "$cmd" ]; then cmd=$arg; else unit=$arg; fi ;;
+    esac
+done
+
+case "$cmd" in
+    is-active)
+        if [ -f "$STATE_DIR/$unit.active" ]; then
+            printf 'active\n'
+        else
+            printf 'inactive\n'
+            exit 3
+        fi
+        ;;
+    is-enabled)
+        if [ -f "$STATE_DIR/$unit.enabled" ]; then
+            printf 'enabled\n'
+        else
+            printf 'disabled\n'
+            exit 1
+        fi
+        ;;
+    enable) : > "$STATE_DIR/$unit.enabled" ;;
+    disable) rm -f "$STATE_DIR/$unit.enabled" ;;
+    start|restart)
+        case "$unit" in
+            headscale) [ "${FAKE_FAIL_HEADSCALE_START:-0}" = 1 ] && exit 1 ;;
+            caddy) [ "${FAKE_FAIL_CADDY_START:-0}" = 1 ] && exit 1 ;;
+        esac
+        : > "$STATE_DIR/$unit.active"
+        ;;
+    stop) rm -f "$STATE_DIR/$unit.active" ;;
     *) exit 0 ;;
 esac
-
+exit 0

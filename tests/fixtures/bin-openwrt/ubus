@@ -1,3 +1,15 @@
 #!/bin/sh
-printf '{"model":"fixture-router","release":{"distribution":"Kwrt","version":"25.12-SNAPSHOT"}}\n'
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'ubus %s\n' "$*" >> "$LOG"
 
+case "$*" in
+    'call system board')
+        printf '{"model":"fixture-router","release":{"distribution":"Kwrt","version":"25.12-SNAPSHOT"}}\n'
+        ;;
+    'call network.interface.lan status')
+        lan_ip=${FAKE_LAN_IP:-192.168.10.1}
+        lan_mask=${FAKE_LAN_MASK:-24}
+        printf '{"uptime":123,"type":"bridge","l3_device":"br-lan","proto":"static","ipv4-address":[{"address":"%s","mask":"%s"}],"route":[{"target":"192.168.10.0","mask":24}],"inactive":null}\n' "$lan_ip" "$lan_mask"
+        ;;
+    *) exit 0 ;;
+esac

@@ -1,5 +1,8 @@
 #!/bin/sh
 case "$1" in
-    ahosts) printf '203.0.113.10 STREAM hs.example.com\n203.0.113.10 DGRAM hs.example.com\n' ;;
+    ahosts)
+        ip=${FAKE_GETENT_IP:-203.0.113.10}
+        printf '%s STREAM hs.example.com\n%s DGRAM hs.example.com\n' "$ip" "$ip"
+        ;;
 esac
 

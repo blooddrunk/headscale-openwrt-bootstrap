@@ -2,9 +2,10 @@
 
 # Headscale + OpenWrt bootstrap, VPS side.
 #
-# Milestone 1 intentionally has no mutating install/apply/update/rollback or
-# cleanup implementation.  discover, plan and status inspect only; backup
-# creates a private, hashed snapshot and does not stop/reload any service.
+# discover/plan/status/verify stay read-only.  install/apply/update/rollback/
+# cleanup/purge and the user/key/route helpers follow the PLAN section 36
+# transaction model: backup before writing, validate before reloading, verify
+# after, restore on failure.
 
 set -f
 umask 077
@@ -14,9 +15,13 @@ VPS_SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd -P) || exit 1
 . "$VPS_SCRIPT_DIR/lib/common.sh" || exit 1
 . "$VPS_SCRIPT_DIR/lib/backup.sh" || exit 1
 . "$VPS_SCRIPT_DIR/lib/version.sh" || exit 1
+. "$VPS_SCRIPT_DIR/lib/state.sh" || exit 1
+. "$VPS_SCRIPT_DIR/lib/net.sh" || exit 1
+. "$VPS_SCRIPT_DIR/lib/vps-ops.sh" || exit 1
 
 VPS_PROGRAM=headscale-vps.sh
 VPS_COMMAND=
+VPS_POSITIONAL=
 VPS_DOMAIN=
 VPS_VERSION=
 VPS_PROXY_MODE=auto
@@ -26,10 +31,15 @@ VPS_METRICS_LISTEN=127.0.0.1:9090
 VPS_GRPC_LISTEN=127.0.0.1:50443
 VPS_ENABLE_DERP=false
 VPS_EXPECTED_PUBLIC_IP=
+VPS_KEY_EXPIRATION=2h
+VPS_KEY_OUTPUT=
+VPS_NODE_ID=
+VPS_ROUTE=
 VPS_BACKUP_DIR=/var/backups/headscale-bootstrap
 BOOTSTRAP_ROOT=/
 BOOTSTRAP_DRY_RUN=0
 BOOTSTRAP_YES=0
+BOOTSTRAP_UNDERSTAND=0
 BOOTSTRAP_JSON=0
 BOOTSTRAP_QUIET=0
 BOOTSTRAP_VERBOSE=0
@@ -37,41 +47,57 @@ BOOTSTRAP_VERBOSE=0
 vps_usage() {
     cat <<'EOF'
 Usage:
-  headscale-vps.sh [global options] <command>
+  headscale-vps.sh [global options] <command> [BACKUP_ID]
 
-Milestone 1 commands (discover/status/plan are read-only):
+Read-only commands:
   discover                 Inspect the VPS without changing it.
-  plan                     Show a guarded future plan; never changes the VPS.
+  plan                     Show a guarded plan; hard conflicts exit 2.
   status                   Check current Headscale/proxy safety and health.
-  verify                   Read-only verification alias for status in Milestone 1.
+  verify                   Read-only alias for status.
   backup                   Create a private timestamped snapshot; no service reload.
 
-Reserved fail-closed commands:
-  install apply update rollback cleanup purge ensure-user issue-key approve-route
+Mutating commands (each backs up before writing, validates, then verifies):
+  install                  Fresh-install the Headscale .deb and render the
+                           managed config keys; never installs a proxy.
+  apply                    Idempotent convergence: config keys, then the
+                           reverse proxy (1panel patch / caddy / nginx / none).
+  ensure-user              Create --user if missing (list first, never twice).
+  issue-key                Issue a one-shot pre-auth key (--user, --expiration,
+                           optional --output FILE mode 0600).
+  approve-route            Approve --route for --node-id on the Headscale side.
+  update                   Upgrade Headscale (stable minors are never skipped).
+  rollback [BACKUP_ID]     Restore config+data+package as one snapshot.
+  cleanup                  Stop/disable Headscale, remove only script-owned
+                           proxy blocks; keep /etc/headscale and /var/lib/headscale.
+  purge                    Destructive: needs --yes-i-understand; backs up first.
 
 Options:
   --domain DOMAIN
-  --version VERSION
+  --version VERSION|latest
   --proxy auto|1panel|caddy|nginx|none
   --user USER
   --listen ADDRESS:PORT
   --metrics-listen ADDRESS:PORT
   --grpc-listen ADDRESS:PORT
-  --enable-embedded-derp true|false
+  --enable-embedded-derp true|false   (true is refused in this build)
   --expected-public-ip IP   Optional DNS-to-VPS comparison input.
+  --expiration DURATION     issue-key lifetime (default 2h)
+  --output FILE             issue-key destination (mode 0600)
+  --node-id ID              approve-route node identifier
+  --route CIDR              approve-route subnet
   --root DIR                Test/fixture root; default is /.
   --backup-dir DIR          Backup directory in the selected root namespace.
-  --dry-run                 Accepted for CLI compatibility; all Milestone 1 commands are non-mutating.
-  --yes                     Accepted for future explicit operations; not sufficient for reserved commands.
+  --dry-run                 Accepted for CLI compatibility.
+  --yes                     Required confirmation for cross-minor update.
+  --yes-i-understand        Required confirmation for purge.
   --json --quiet --verbose
   -h, --help
 
-Hard boundaries in this milestone:
-  - no service start/stop/restart/reload;
-  - no package installation;
-  - no config rewrite or reverse-proxy reload;
-  - no public bind is proposed for Headscale 8080/9090/50443;
-  - no OpenWrt/network/firewall operation is performed by this script.
+Hard boundaries:
+  - Headscale 8080/9090/50443 stay on loopback; TLS belongs to the proxy;
+  - no port is ever taken from an unknown 80/443 owner and no process is killed;
+  - configtest must pass before any restart; backups precede every write;
+  - upgrades never skip a stable minor; rollback restores one consistent snapshot.
 EOF
 }
 
@@ -166,6 +192,30 @@ vps_parse_args() {
                 shift 2
                 ;;
             --expected-public-ip=*) VPS_EXPECTED_PUBLIC_IP=${1#*=}; shift ;;
+            --expiration)
+                vps_need_value "$@"
+                VPS_KEY_EXPIRATION=$2
+                shift 2
+                ;;
+            --expiration=*) VPS_KEY_EXPIRATION=${1#*=}; shift ;;
+            --output)
+                vps_need_value "$@"
+                VPS_KEY_OUTPUT=$2
+                shift 2
+                ;;
+            --output=*) VPS_KEY_OUTPUT=${1#*=}; shift ;;
+            --node-id)
+                vps_need_value "$@"
+                VPS_NODE_ID=$2
+                shift 2
+                ;;
+            --node-id=*) VPS_NODE_ID=${1#*=}; shift ;;
+            --route)
+                vps_need_value "$@"
+                VPS_ROUTE=$2
+                shift 2
+                ;;
+            --route=*) VPS_ROUTE=${1#*=}; shift ;;
             --root)
                 vps_need_value "$@"
                 BOOTSTRAP_ROOT=$2
@@ -179,13 +229,23 @@ vps_parse_args() {
                 ;;
             --backup-dir=*) VPS_BACKUP_DIR=${1#*=}; shift ;;
             --dry-run) BOOTSTRAP_DRY_RUN=1; shift ;;
-            --yes|--yes-i-understand) BOOTSTRAP_YES=1; shift ;;
+            --yes) BOOTSTRAP_YES=1; shift ;;
+            --yes-i-understand) BOOTSTRAP_UNDERSTAND=1; shift ;;
             --json) BOOTSTRAP_JSON=1; shift ;;
             --quiet) BOOTSTRAP_QUIET=1; shift ;;
             --verbose) BOOTSTRAP_VERBOSE=1; shift ;;
             -h|--help) vps_usage; exit 0 ;;
             --) shift; while [ "$#" -gt 0 ]; do die "unexpected argument after --: $1"; done ;;
-            *) die "unknown option or command: $1" ;;
+            -*) die "unknown option: $1" ;;
+            *)
+                if [ -n "$VPS_COMMAND" ]; then
+                    [ -z "$VPS_POSITIONAL" ] || die "multiple positional arguments: $VPS_POSITIONAL and $1"
+                    VPS_POSITIONAL=$1
+                    shift
+                else
+                    die "unknown command: $1"
+                fi
+                ;;
         esac
     done
 
@@ -372,8 +432,15 @@ vps_collect_facts() {
 
     VPS_HEADSCALE_VERSION=absent
     if bootstrap_command_exists headscale; then
-        VPS_HEADSCALE_VERSION=$(bootstrap_capture_first_line headscale version)
-        [ -n "$VPS_HEADSCALE_VERSION" ] || VPS_HEADSCALE_VERSION=present-version-unknown
+        vps_version_output=$(headscale version 2>/dev/null)
+        vps_version_status=$?
+        if [ "$vps_version_status" = 0 ] && [ -n "$vps_version_output" ]; then
+            VPS_HEADSCALE_VERSION=$(printf '%s\n' "$vps_version_output" | sed -n '1p')
+        elif [ "$vps_version_status" = 127 ]; then
+            VPS_HEADSCALE_VERSION=absent
+        else
+            VPS_HEADSCALE_VERSION=present-version-unknown
+        fi
     fi
 
     VPS_SERVICE_ACTIVE=unknown
@@ -472,7 +539,7 @@ vps_collect_facts() {
     VPS_PANEL_BUFFERING=unknown
     [ -f "$VPS_PANEL_ROOT_CONF" ] && VPS_PANEL_ROOT_PRESENT=yes
     if [ "$VPS_PANEL_ROOT_PRESENT" = yes ]; then
-        if grep -qF 'proxy_buffering off;' "$VPS_PANEL_ROOT_CONF" 2>/dev/null; then
+        if bootstrap_active_config_lines "$VPS_PANEL_ROOT_CONF" | grep -qF 'proxy_buffering off;' 2>/dev/null; then
             VPS_PANEL_BUFFERING=present
         else
             VPS_PANEL_BUFFERING=missing
@@ -670,10 +737,10 @@ vps_print_discover() {
     fi
 }
 
-vps_plan() {
-    vps_collect_facts
-    vps_safe_config_state
-    vps_effective_proxy
+vps_compute_conflicts() {
+    # Shared hard guards for plan and every mutating command.  Keep in sync
+    # with PLAN sections 2.1, 7, 9 and 33.4 (one Headscale network per host).
+    vps_conflicts_mode=${1:-plan}
     vps_plan_blocked=0
     vps_block_reasons=
 
@@ -685,13 +752,9 @@ vps_plan() {
         vps_plan_blocked=1
         vps_block_reasons="$vps_block_reasons data-present-without-config"
     fi
-    if [ -n "$VPS_VERSION" ]; then
-        vps_plan_blocked=1
-        vps_block_reasons="$vps_block_reasons version-transaction-not-implemented-in-milestone-1"
-    fi
     if [ "$VPS_ENABLE_DERP" = true ]; then
         vps_plan_blocked=1
-        vps_block_reasons="$vps_block_reasons embedded-derp-transaction-not-implemented-in-milestone-1"
+        vps_block_reasons="$vps_block_reasons embedded-derp-not-supported-in-this-build"
     fi
     [ -n "$VPS_EFFECTIVE_DOMAIN" ] || {
         vps_plan_blocked=1
@@ -749,6 +812,11 @@ vps_plan() {
         vps_plan_blocked=1
         vps_block_reasons="$vps_block_reasons unknown-service-on-443"
     fi
+}
+
+vps_plan() {
+    vps_refresh
+    vps_compute_conflicts plan
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -776,7 +844,7 @@ vps_plan() {
         printf '  DNS: %s; match=%s%s\n' "$VPS_DNS_STATUS" "$VPS_DNS_MATCH" \
             "$( [ "$VPS_DNS_POSSIBLE_PROXY" = yes ] && printf ' (possible proxy/non-VPS answer)' )"
         printf '  current config safety: %s (%s)\n' "$VPS_SAFE_CONFIG" "$VPS_CONFIG_SAFETY_REASON"
-        printf '\nWould change in a later Milestone (not now):\n'
+        printf '\nplan itself changes nothing; install/apply would:\n'
         if [ "$VPS_CONFIG_PRESENT" = no ]; then
             printf '  - install and validate the requested Headscale package/config baseline\n'
         else
@@ -792,13 +860,13 @@ vps_plan() {
             none) printf '  - keep TLS ownership explicit; no public plaintext Headscale listener\n' ;;
             *) printf '  - no proxy change can be planned until ownership is unambiguous\n' ;;
         esac
-        printf '\nWill NOT change in this milestone:\n'
-        printf '  - no package install, service restart/reload, config write, database write, DNS/Cloudflare change, or process kill\n'
+        printf '\nNever changed by this script:\n'
+        printf '  - no DNS/Cloudflare record edits, no process kills, no port takeover from unknown owners\n'
         printf '  - no public bind for 8080/9090/50443; no unconditional 3478/udp opening\n'
         if [ "$vps_plan_blocked" -eq 1 ]; then
             printf '\nBLOCKED: %s\n' "${vps_block_reasons# }"
         else
-            printf '\nREADY FOR FUTURE MILESTONE: discovery did not find a hard conflict.\n'
+            printf '\nREADY: no hard conflict found; install/apply may proceed.\n'
         fi
     fi
 
@@ -905,65 +973,10 @@ vps_status() {
 }
 
 vps_backup() {
-    vps_collect_facts
-    bootstrap_sha256_available || die 'backup requires sha256sum, shasum, or openssl'
     if [ "$BOOTSTRAP_ROOT" = / ] && [ "$(id -u 2>/dev/null || printf 1)" != 0 ]; then
         die 'backup of the real VPS requires root; use --root DIR only for an explicit fixture'
     fi
-
-    VPS_BACKUP_BASE=$(bootstrap_root_path "$VPS_BACKUP_DIR")
-    VPS_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
-    VPS_BACKUP_ROOT=$(backup_allocate_directory "$VPS_BACKUP_BASE" "$VPS_BACKUP_TIMESTAMP") || die "cannot allocate backup directory below: $VPS_BACKUP_BASE"
-    VPS_BACKUP_ID=${VPS_BACKUP_ROOT##*/}
-    chmod 700 "$VPS_BACKUP_ROOT" 2>/dev/null || true
-    backup_mark_incomplete "$VPS_BACKUP_ROOT"
-
-    backup_copy_path "$VPS_CONFIG_DIR" "$VPS_BACKUP_ROOT/source/etc/headscale" || {
-        backup_mark_incomplete "$VPS_BACKUP_ROOT"
-        die 'failed to copy /etc/headscale; incomplete backup retained'
-    }
-    backup_copy_path "$VPS_DATA_PATH" "$VPS_BACKUP_ROOT/source/var/lib/headscale" || {
-        backup_mark_incomplete "$VPS_BACKUP_ROOT"
-        die 'failed to copy /var/lib/headscale; incomplete backup retained'
-    }
-    backup_copy_path "$VPS_UNIT_PATH" "$VPS_BACKUP_ROOT/source/usr/lib/systemd/system/headscale.service" || {
-        backup_mark_incomplete "$VPS_BACKUP_ROOT"
-        die 'failed to copy headscale.service; incomplete backup retained'
-    }
-
-    if [ -n "$VPS_PANEL_VHOST_PATH" ]; then
-        backup_copy_path "$VPS_PANEL_VHOST_PATH" "$VPS_BACKUP_ROOT/proxy/vhost.conf" || {
-            backup_mark_incomplete "$VPS_BACKUP_ROOT"
-            die 'failed to copy detected 1Panel vhost; incomplete backup retained'
-        }
-    fi
-    if [ "$VPS_PANEL_ROOT_PRESENT" = yes ]; then
-        backup_copy_path "$VPS_PANEL_ROOT_CONF" "$VPS_BACKUP_ROOT/proxy/root.conf" || {
-            backup_mark_incomplete "$VPS_BACKUP_ROOT"
-            die 'failed to copy detected 1Panel proxy root; incomplete backup retained'
-        }
-    fi
-    if [ "$VPS_CADDYFILE_PRESENT" = yes ] && { [ "$VPS_PROXY_MODE" = caddy ] || [ "$VPS_PROXY_MODE" = auto ]; }; then
-        backup_copy_path "$(bootstrap_root_path /etc/caddy/Caddyfile)" "$VPS_BACKUP_ROOT/proxy/Caddyfile" || {
-            backup_mark_incomplete "$VPS_BACKUP_ROOT"
-            die 'failed to copy detected Caddyfile; incomplete backup retained'
-        }
-    fi
-
-    {
-        printf 'vhost_source=%s\n' "${VPS_PANEL_VHOST_PATH:-absent}"
-        printf 'proxy_root_source=%s\n' "${VPS_PANEL_ROOT_CONF:-absent}"
-        printf 'domain=%s\n' "${VPS_EFFECTIVE_DOMAIN:-unknown}"
-        printf 'headscale_version=%s\n' "$VPS_HEADSCALE_VERSION"
-    } > "$VPS_BACKUP_ROOT/proxy/paths.txt"
-    chmod 600 "$VPS_BACKUP_ROOT/proxy/paths.txt" 2>/dev/null || true
-    printf '%s\n' "$VPS_HEADSCALE_VERSION" > "$VPS_BACKUP_ROOT/package-version.txt"
-    chmod 600 "$VPS_BACKUP_ROOT/package-version.txt" 2>/dev/null || true
-
-    backup_finish "$VPS_BACKUP_ROOT" "$VPS_PROGRAM" "$BOOTSTRAP_ROOT" "$VPS_BACKUP_TIMESTAMP" || {
-        backup_mark_incomplete "$VPS_BACKUP_ROOT"
-        die 'failed to finalize backup manifest; incomplete backup retained'
-    }
+    vps_backup_create || die 'backup failed'
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -981,12 +994,6 @@ vps_backup() {
     fi
 }
 
-vps_reserved_command() {
-    log_error "$VPS_COMMAND is reserved for a later Milestone and is fail-closed in this build"
-    log_error 'No package, service, config, database, DNS, proxy, UCI, netifd, or firewall change was attempted'
-    exit 2
-}
-
 vps_main() {
     vps_parse_args "$@"
     case "$VPS_COMMAND" in
@@ -994,7 +1001,16 @@ vps_main() {
         plan) vps_plan ;;
         status|verify) vps_status ;;
         backup) vps_backup ;;
-        *) vps_reserved_command ;;
+        install) vps_install ;;
+        apply) vps_apply ;;
+        ensure-user) vps_ensure_user ;;
+        issue-key) vps_issue_key ;;
+        approve-route) vps_approve_route ;;
+        update) vps_update ;;
+        rollback) vps_rollback ;;
+        cleanup) vps_cleanup ;;
+        purge) vps_purge ;;
+        *) die "unhandled command: $VPS_COMMAND" ;;
     esac
 }
 

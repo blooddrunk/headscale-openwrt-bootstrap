@@ -1,0 +1,12 @@
+#!/bin/sh
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'nginx %s\n' "$*" >> "$LOG"
+
+case "$1" in
+    -v|-V) printf 'nginx version: 1.26.0\n' ;;
+    -t)
+        [ "${FAKE_FAIL_NGINX_T:-0}" = 1 ] && { printf 'nginx: injected -t failure\n' >&2; exit 1; }
+        printf 'syntax is ok\n'
+        ;;
+    *) exit 0 ;;
+esac

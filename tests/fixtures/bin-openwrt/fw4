@@ -1,6 +1,17 @@
 #!/bin/sh
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'fw4 %s\n' "$*" >> "$LOG"
+
 case "$1" in
-    device) printf 'tailscale\n' ;;
+    device)
+        case "$2" in
+            tailscale0) printf 'tailscale\n' ;;
+            *) printf 'none\n' ;;
+        esac
+        ;;
+    check)
+        [ "${FAKE_FAIL_FW4_CHECK:-0}" = 1 ] && { printf 'fw4 check failed (injected)\n' >&2; exit 1; }
+        printf 'syntax ok\n'
+        ;;
     *) printf 'syntax ok\n' ;;
 esac
-

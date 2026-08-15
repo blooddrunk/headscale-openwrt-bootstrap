@@ -1,0 +1,38 @@
+# Fixture payload: the default config a freshly installed headscale .deb
+# would place on disk.  It carries the managed keys plus unrelated keys the
+# renderer must preserve verbatim, and a commented listen_addr that comment
+# aware parsing must ignore.
+server_url: http://127.0.0.1:8080
+
+# listen_addr: 0.0.0.0:8080
+listen_addr: 127.0.0.1:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: true
+
+disable_check_updates: false
+ephemeral_node_inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+tls_cert_path: ""
+tls_key_path: ""
+
+trusted_proxies: []

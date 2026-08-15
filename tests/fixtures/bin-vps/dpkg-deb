@@ -1,0 +1,38 @@
+#!/bin/sh
+# Fixture dpkg-deb: report Package/Version fields for the fake .deb files the
+# fixture curl writes ("FAKEDEB <version>" first line).
+
+LOG=${FAKE_LOG:-}
+[ -n "$LOG" ] && printf 'dpkg-deb %s\n' "$*" >> "$LOG"
+
+# Syntax: dpkg-deb --field FILE [FIELD...]
+deb_file=
+fields=
+seen_field_flag=
+for arg in "$@"; do
+    if [ "$arg" = "--field" ] || [ "$arg" = "-f" ]; then
+        seen_field_flag=1
+        continue
+    fi
+    case "$arg" in
+        -*) continue ;;
+    esac
+    if [ -z "$deb_file" ]; then
+        [ -f "$arg" ] && deb_file=$arg
+    else
+        fields="$fields $arg"
+    fi
+done
+
+[ -n "$deb_file" ] || { printf 'dpkg-deb: no readable package file\n' >&2; exit 1; }
+deb_version=$(sed -n 's/^FAKEDEB //p' "$deb_file" | sed -n '1p')
+[ -n "$deb_version" ] || { printf 'dpkg-deb: not a fixture package\n' >&2; exit 1; }
+
+[ -z "$fields" ] && fields=' Package Version'
+for field in $fields; do
+    case "$field" in
+        Package) printf 'headscale\n' ;;
+        Version) printf '%s\n' "$deb_version" ;;
+        *) printf '\n' ;;
+    esac
+done
