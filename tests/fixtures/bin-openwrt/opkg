@@ -1,11 +1,16 @@
 #!/bin/sh
-# Fixture opkg: installed-state markers live in $FAKE_OPENWRT_ROOT/.opkg-installed
-# and per-package versions in $FAKE_OPENWRT_ROOT/.opkg-versions.
+# Fixture opkg: installed-state markers live in $FAKE_OPENWRT_ROOT/.opkg-installed,
+# per-package versions in $FAKE_OPENWRT_ROOT/.opkg-versions, and user-installed
+# flags in $FAKE_OPENWRT_ROOT/.opkg-user.  Real opkg writes
+# `Status: install user installed` for packages installed by name (SF_USER is
+# a persistent flag) and `Status: install ok installed` for packages that came
+# in as dependencies or were baked into the image; the fixture mirrors that.
 
 ROOT=${FAKE_OPENWRT_ROOT:-}
 LOG=${FAKE_LOG:-}
 MARKERS=$ROOT/.opkg-installed
 VERSIONS=$ROOT/.opkg-versions
+USERFLAGS=$ROOT/.opkg-user
 [ -n "$LOG" ] && printf 'opkg %s\n' "$*" >> "$LOG"
 
 pkg_version() {
@@ -23,7 +28,9 @@ case "$1" in
     status)
         pkg=$2
         [ -f "$MARKERS/$pkg" ] || exit 1
-        printf 'Package: %s\nStatus: install ok installed\nVersion: %s\n' "$pkg" "$(pkg_version "$pkg")"
+        flags=ok
+        [ -f "$USERFLAGS/$pkg" ] && flags=user
+        printf 'Package: %s\nStatus: install %s installed\nVersion: %s\n' "$pkg" "$flags" "$(pkg_version "$pkg")"
         ;;
     list-installed)
         [ -d "$MARKERS" ] || exit 0
@@ -39,8 +46,9 @@ case "$1" in
     install)
         pkg=$2
         if [ "${FAKE_FAIL_OPKG:-0}" = 1 ]; then exit 1; fi
-        mkdir -p "$MARKERS" "$VERSIONS"
+        mkdir -p "$MARKERS" "$VERSIONS" "$USERFLAGS"
         : > "$MARKERS/$pkg"
+        : > "$USERFLAGS/$pkg"
         printf '%s\n' "${FAKE_OPKG_INSTALL_VERSION:-1.98.3-r1}" > "$VERSIONS/$pkg"
         ;;
     upgrade)

@@ -601,6 +601,14 @@ openwrt_socket_state() {
     '
 }
 
+openwrt_opkg_installed() {
+    # opkg writes `Status: <want> <flags> <state>`; a package installed by
+    # name carries the persistent SF_USER flag, so the flags field reads
+    # "user" (or "hold,user", ...) instead of "ok".  Only the last field
+    # states whether the package is actually installed.
+    opkg status "$1" 2>/dev/null | awk '/^Status:/{ found=1; ok=($NF=="installed") } END { exit (found && ok) ? 0 : 1 }'
+}
+
 openwrt_collect_facts() {
     OPENWRT_ETC_TAILSCALE=$(openwrt_target_path /etc/tailscale)
     OPENWRT_TS_STATE=$(openwrt_target_path /etc/tailscale/tailscaled.state)
@@ -645,8 +653,8 @@ openwrt_collect_facts() {
     OPENWRT_TAILSCALE_PACKAGE=unknown
     OPENWRT_LUCI_PACKAGE=unknown
     if [ "$OPENWRT_PACKAGE_MANAGER" = opkg ]; then
-        if opkg status tailscale 2>/dev/null | grep -qF 'Status: install ok installed'; then OPENWRT_TAILSCALE_PACKAGE=installed; else OPENWRT_TAILSCALE_PACKAGE=absent; fi
-        if opkg status luci-app-tailscale 2>/dev/null | grep -qF 'Status: install ok installed'; then OPENWRT_LUCI_PACKAGE=installed; else OPENWRT_LUCI_PACKAGE=absent; fi
+        if openwrt_opkg_installed tailscale; then OPENWRT_TAILSCALE_PACKAGE=installed; else OPENWRT_TAILSCALE_PACKAGE=absent; fi
+        if openwrt_opkg_installed luci-app-tailscale; then OPENWRT_LUCI_PACKAGE=installed; else OPENWRT_LUCI_PACKAGE=absent; fi
     elif [ "$OPENWRT_PACKAGE_MANAGER" = apk ]; then
         if apk info -e tailscale >/dev/null 2>&1; then OPENWRT_TAILSCALE_PACKAGE=installed; else OPENWRT_TAILSCALE_PACKAGE=absent; fi
         if apk info -e luci-app-tailscale >/dev/null 2>&1; then OPENWRT_LUCI_PACKAGE=installed; else OPENWRT_LUCI_PACKAGE=absent; fi

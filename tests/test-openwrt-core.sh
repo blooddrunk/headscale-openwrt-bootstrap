@@ -99,6 +99,13 @@ assert_contains "$OUT" 'Install complete'
 [ -L "$ROOT/etc/rc.d/S90tailscale-core" ] || fail 'tailscale-core not enabled at boot'
 [ ! -e "$ROOT/etc/rc.d/S90tailscale" ] || fail 'unsafe stock service still enabled'
 log_has 'opkg install tailscale' || fail 'opkg install not called'
+# Regression: real opkg writes `Status: install user installed` for packages
+# installed by name (persistent SF_USER flag); the freshly installed package
+# must still be detected as installed instead of dying with
+# "tailscale package still not installed".
+assert_contains "$(FAKE_OPENWRT_ROOT=$ROOT "$OPENWRT_BIN/opkg" status tailscale)" \
+    'Status: install user installed'
+assert_contains "$(run_ow --login-server "$LOGIN" discover --json)" '"tailscale_package":"installed"'
 log_has 'init tailscale disable' || fail 'stock service must be disabled'
 log_not_has 'init tailscale stop' || fail 'stock service must never be stopped'
 log_not_has 'network reload' || fail 'network reload must never appear'
