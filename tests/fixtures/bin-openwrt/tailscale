@@ -78,7 +78,10 @@ case "$1 $2" in
         ;;
     'debug prefs'|'debug prefs'*)
         if logged_in; then
-            cat "$PREFS"
+            # Emit pretty-printed JSON like the real CLI (MarshalIndent):
+            # the AdvertiseRoutes array spreads across lines, so per-line
+            # parsers must flatten first.  Storage stays compact.
+            sed -e 's/{/{\n\t/g' -e 's/,/,\n\t/g' -e 's/\([^[]\)\]/\1\n]/g' "$PREFS"
         else
             printf 'cannot load prefs: not logged in\n' >&2
             exit 1

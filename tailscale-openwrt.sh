@@ -539,17 +539,20 @@ openwrt_parse_prefs() {
         return 0
     fi
 
-    OPENWRT_PREFS_TEXT=$(tailscale debug prefs 2>/dev/null)
+    # `tailscale debug prefs` pretty-prints JSON across lines (arrays spread
+    # their elements), so flatten before the single-line seds and bound the
+    # AdvertiseRoutes capture to the first closing bracket.
+    OPENWRT_PREFS_TEXT=$(tailscale debug prefs 2>/dev/null | tr '\n\t' '  ')
     [ -n "$OPENWRT_PREFS_TEXT" ] && OPENWRT_PREFS_READABLE=yes
     OPENWRT_CURRENT_CONTROL_URL=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"ControlURL"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
-    [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] || OPENWRT_CURRENT_CONTROL_URL=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*ControlURL[[:space:]]*[:=][[:space:]]*//p' | sed 's/[", ]//g' | sed -n '1p')
+    [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] || OPENWRT_CURRENT_CONTROL_URL=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*ControlURL[[:space:]]*[:=][[:space:]]*\([^",[:space:]]*\).*/\1/p' | sed -n '1p')
     OPENWRT_CURRENT_CONTROL_URL=$(bootstrap_normalize_url "$OPENWRT_CURRENT_CONTROL_URL")
 
     OPENWRT_CURRENT_ACCEPT_DNS=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"CorpDNS"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | sed -n '1p')
     [ -n "$OPENWRT_CURRENT_ACCEPT_DNS" ] || OPENWRT_CURRENT_ACCEPT_DNS=unknown
     OPENWRT_CURRENT_ACCEPT_ROUTES=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"RouteAll"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | sed -n '1p')
     [ -n "$OPENWRT_CURRENT_ACCEPT_ROUTES" ] || OPENWRT_CURRENT_ACCEPT_ROUTES=unknown
-    OPENWRT_CURRENT_ADVERTISE_ROUTES=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"AdvertiseRoutes"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' | sed -n '1p' | tr -d '"' | tr ',' ' ' | awk '{$1=$1; print}')
+    OPENWRT_CURRENT_ADVERTISE_ROUTES=$(printf '%s\n' "$OPENWRT_PREFS_TEXT" | sed -n 's/.*"AdvertiseRoutes"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | sed -n '1p' | tr -d '"' | tr ',' ' ' | awk '{$1=$1; print}')
     case "$OPENWRT_CURRENT_ADVERTISE_ROUTES" in
         *0.0.0.0/0*|*::/0*) OPENWRT_EXIT_NODE_RISK=yes ;;
     esac
