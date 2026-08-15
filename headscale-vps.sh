@@ -410,7 +410,11 @@ vps_collect_facts() {
     VPS_CONFIG_PRESENT=no
     VPS_DATA_PRESENT=no
     [ -f "$VPS_CONFIG_PATH" ] && VPS_CONFIG_PRESENT=yes
-    [ -d "$VPS_DATA_PATH" ] && VPS_DATA_PRESENT=yes
+    # The package ships an empty data directory; only actual contents count
+    # as data worth protecting (a never-started install has nothing to lose).
+    if [ -d "$VPS_DATA_PATH" ] && [ -n "$(ls -A "$VPS_DATA_PATH" 2>/dev/null)" ]; then
+        VPS_DATA_PRESENT=yes
+    fi
 
     VPS_OS_ID=unknown
     VPS_OS_VERSION_ID=unknown
@@ -744,7 +748,14 @@ vps_compute_conflicts() {
     vps_plan_blocked=0
     vps_block_reasons=
 
-    if [ "$VPS_CONFIG_PRESENT" = yes ] && [ -n "$VPS_DOMAIN" ] && [ -n "$VPS_DETECTED_DOMAIN" ] && [ "$VPS_DOMAIN" != "$VPS_DETECTED_DOMAIN" ]; then
+    # A loopback server_url is the packaged baseline (or a rollback that
+    # restored it), not a foreign deployment; apply rewrites it instead of
+    # deadlocking on the domain mismatch.
+    case "$VPS_DETECTED_DOMAIN" in
+        127.0.0.1|localhost|::1) vps_conflicts_loopback_baseline=true ;;
+        *) vps_conflicts_loopback_baseline=false ;;
+    esac
+    if [ "$VPS_CONFIG_PRESENT" = yes ] && [ "$vps_conflicts_loopback_baseline" = false ] && [ -n "$VPS_DOMAIN" ] && [ -n "$VPS_DETECTED_DOMAIN" ] && [ "$VPS_DOMAIN" != "$VPS_DETECTED_DOMAIN" ]; then
         vps_plan_blocked=1
         vps_block_reasons="$vps_block_reasons existing-server-url-domain-differs"
     fi
@@ -789,8 +800,16 @@ vps_compute_conflicts() {
         vps_block_reasons="$vps_block_reasons derp-disabled-but-3478-listening"
     fi
     if [ "$VPS_SAFE_CONFIG" = no ]; then
-        vps_plan_blocked=1
-        vps_block_reasons="$vps_block_reasons existing-config-unsafe"
+        if [ "$vps_conflicts_mode" = mutate ]; then
+            # Every safety reason covers a managed key the renderer rewrites
+            # (server_url, listen addrs, TLS paths); blocking apply on them
+            # would make a rolled-back install unrepairable.  plan stays
+            # strict so the audit view still reports the drift.
+            log_warn "existing config fails the safety audit (${VPS_CONFIG_SAFETY_REASON}); the managed keys will be rewritten"
+        else
+            vps_plan_blocked=1
+            vps_block_reasons="$vps_block_reasons existing-config-unsafe"
+        fi
     fi
     if [ "$VPS_EFFECTIVE_PROXY" = 1panel ] && [ "$VPS_PANEL_ROOT_PRESENT" != yes ]; then
         vps_plan_blocked=1

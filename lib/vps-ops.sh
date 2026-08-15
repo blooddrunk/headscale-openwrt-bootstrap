@@ -174,6 +174,17 @@ vps_render_config() {
     ' "$render_src" > "$render_dst"
 }
 
+vps_config_fix_permissions() {
+    # The script runs under umask 077 (state files and keys need it), so every
+    # config file it places inherits 0600 root:root and the headscale service
+    # user cannot read it; normalize to a service-readable layout.
+    chmod 755 "$VPS_CONFIG_DIR" 2>/dev/null || true
+    chmod 640 "$VPS_CONFIG_PATH" 2>/dev/null || true
+    if [ "$BOOTSTRAP_ROOT" = / ]; then
+        chown root:headscale "$VPS_CONFIG_PATH" 2>/dev/null || true
+    fi
+}
+
 vps_configtest_file() {
     headscale -c "$1" configtest >/dev/null 2>&1
 }
@@ -205,10 +216,12 @@ vps_config_write_transaction() {
     }
     log_change "backed up config to $VPS_BACKUP_ROOT"
     mv "$vps_cwt_tmp" "$VPS_CONFIG_PATH" || return 1
+    vps_config_fix_permissions
     vps_configtest_file "$VPS_CONFIG_PATH" || {
         log_error 'configtest failed on the installed config; restoring backup'
         if [ -f "$VPS_BACKUP_ROOT/source/etc/headscale/config.yaml" ]; then
             cp "$VPS_BACKUP_ROOT/source/etc/headscale/config.yaml" "$VPS_CONFIG_PATH"
+            vps_config_fix_permissions
         fi
         return 1
     }
@@ -218,6 +231,7 @@ vps_config_write_transaction() {
 vps_restore_config_backup() {
     [ -f "$VPS_BACKUP_ROOT/source/etc/headscale/config.yaml" ] || return 0
     cp "$VPS_BACKUP_ROOT/source/etc/headscale/config.yaml" "$VPS_CONFIG_PATH" && \
+        vps_config_fix_permissions && \
         vps_configtest_file "$VPS_CONFIG_PATH"
 }
 
@@ -301,10 +315,13 @@ vps_install() {
     fi
 
     if [ ! -f "$VPS_CONFIG_PATH" ]; then
-        vps_example=$(bootstrap_root_path /etc/headscale/config.example.yaml)
+        vps_example=$(bootstrap_root_path /etc/headscale/config.yaml)
+        [ -f "$vps_example" ] || vps_example=$(bootstrap_root_path /etc/headscale/config.example.yaml)
+        [ -f "$vps_example" ] || vps_example=$(bootstrap_root_path /usr/share/doc/headscale/examples/config-example.yaml)
         if [ -f "$vps_example" ]; then
             cp "$vps_example" "$VPS_CONFIG_PATH" || die 'failed to seed config.yaml from the packaged example'
-            log_change 'seeded /etc/headscale/config.yaml from packaged example'
+            vps_config_fix_permissions
+            log_change "seeded /etc/headscale/config.yaml from $vps_example"
         else
             die 'installed package provides no config baseline (no config.yaml and no config.example.yaml)'
         fi
@@ -346,7 +363,18 @@ vps_apply() {
     vps_conflict_or_die
 
     [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed; run install first'
-    [ "$VPS_CONFIG_PRESENT" = yes ] || die "$VPS_CONFIG_PATH missing; run install first"
+    if [ "$VPS_CONFIG_PRESENT" != yes ]; then
+        # A config can be missing after a failed install was rolled back or
+        # an operator deleted it; re-seed from the packaged baseline.
+        vps_apply_baseline=$(bootstrap_root_path /etc/headscale/config.yaml)
+        [ -f "$vps_apply_baseline" ] || vps_apply_baseline=$(bootstrap_root_path /etc/headscale/config.example.yaml)
+        [ -f "$vps_apply_baseline" ] || vps_apply_baseline=$(bootstrap_root_path /usr/share/doc/headscale/examples/config-example.yaml)
+        [ -f "$vps_apply_baseline" ] || die "no packaged config baseline to seed $VPS_CONFIG_PATH from; reinstall the headscale package"
+        cp "$vps_apply_baseline" "$VPS_CONFIG_PATH" || die 'failed to seed config.yaml from the packaged baseline'
+        vps_config_fix_permissions
+        VPS_CONFIG_PRESENT=yes
+        log_change "seeded $VPS_CONFIG_PATH from $vps_apply_baseline"
+    fi
 
     vps_tmp_config=${TMPDIR:-/tmp}/headscale-config.$$.yaml
     vps_render_config "$VPS_CONFIG_PATH" "$vps_tmp_config" || {
@@ -865,6 +893,7 @@ vps_update_step() {
         return 1
     }
     mv "$vps_tmp_config" "$VPS_CONFIG_PATH"
+    vps_config_fix_permissions
     systemctl start headscale || {
         log_error 'service failed to start after update; rolling back to the backup state'
         vps_rollback_to "$VPS_BACKUP_ROOT" || true
@@ -975,6 +1004,7 @@ vps_rollback_to() {
     if [ -d "$vps_rb_dir/source/etc/headscale" ]; then
         rm -rf "$VPS_CONFIG_DIR"
         cp -a "$vps_rb_dir/source/etc/headscale" "$VPS_CONFIG_DIR" || return 1
+        vps_config_fix_permissions
     fi
     if [ -d "$vps_rb_dir/source/var/lib/headscale" ]; then
         rm -rf "$VPS_DATA_PATH"

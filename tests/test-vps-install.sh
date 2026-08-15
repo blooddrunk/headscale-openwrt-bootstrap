@@ -239,4 +239,39 @@ assert_file_contains "$ROOT/etc/caddy/Caddyfile" 'foreign operator config'
 assert_file_not_contains "$ROOT/etc/caddy/Caddyfile" 'reverse_proxy http://127.0.0.1:8080'
 if log_has 'systemctl start caddy'; then fail 'must not start caddy after validate failure'; fi
 
+################################################################
+# E. Recovery paths: service-readable permissions, unsafe heal, seeding
+################################################################
+
+# E1. The script's global umask 077 must not leave the config 0600 root:root
+#     (regression: the headscale service user got "permission denied" and
+#     crash-looped on every install).
+make_fresh_root vps-e1
+env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+    "$VPS_SCRIPT" --root "$ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 install >/dev/null
+[ "$(stat -c %a "$ROOT/etc/headscale/config.yaml")" = 640 ] || fail 'config must be 0640 so the service user can read it'
+
+# E2. A rollback that restored the packaged baseline (server_url
+#     http://127.0.0.1) must not deadlock apply: the managed keys are
+#     rewritten and the config converges back to https.
+make_fresh_root vps-e2
+env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+    "$VPS_SCRIPT" --root "$ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 install >/dev/null
+sed -i 's|^server_url: https://hs.example.com|server_url: http://127.0.0.1:8080|' "$ROOT/etc/headscale/config.yaml"
+log_reset
+OUT=$(env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+    "$VPS_SCRIPT" --root "$ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 apply)
+assert_contains "$OUT" 'Apply complete'
+assert_file_contains "$ROOT/etc/headscale/config.yaml" 'server_url: https://hs.example.com'
+[ "$(stat -c %a "$ROOT/etc/headscale/config.yaml")" = 640 ] || fail 'healed config must stay 0640'
+
+# E3. apply re-seeds a missing config from the packaged baseline.
+rm -f "$ROOT/etc/headscale/config.yaml"
+cp "$TEST_DIR/fixtures/deb-payload/config.example.yaml" "$ROOT/etc/headscale/config.example.yaml"
+log_reset
+OUT=$(env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+    "$VPS_SCRIPT" --root "$ROOT" --domain hs.example.com --expected-public-ip 203.0.113.10 apply)
+assert_contains "$OUT" 'Apply complete'
+assert_file_contains "$ROOT/etc/headscale/config.yaml" 'server_url: https://hs.example.com'
+
 printf 'VPS install/apply/1panel tests passed.\n'
