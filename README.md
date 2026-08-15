@@ -85,13 +85,31 @@ cd /root/headscale-openwrt-bootstrap
 # 2. 安装 tailscale 包 + tailscale-core 服务（危险 stock 服务只会被 disable）
 ./tailscale-openwrt.sh --login-server https://hs.example.com install
 
-# 3. 注册节点（auth key 文件需为 0400/0600 权限，注册成功后自动删除）
+# 3. 注册节点：下面两种 auth key 输入方式二选一
+# 3a. 预先保存为 0400/0600 文件；注册成功后脚本自动删除
 ./tailscale-openwrt.sh --login-server https://hs.example.com \
     --auth-key-file /tmp/hs-auth-key join
+
+# 3b. 直接从 stdin 读取一行；运行后粘贴 auth key 并按 Enter
+./tailscale-openwrt.sh --login-server https://hs.example.com \
+    --auth-key-stdin join
 
 # 4. （可选）把 LAN 网段作为 subnet router 广播出去
 ./tailscale-openwrt.sh --login-server https://hs.example.com enable-subnet
 ~~~
+
+`--auth-key-file` 和 `--auth-key-stdin` 互斥。`--auth-key-stdin` 不会把
+key 放进命令参数或日志；脚本只读取一行非空内容，内部用 `0600` 临时文件
+通过 `file:` 交给 Tailscale，并在成功或失败退出时清理该临时文件。若使用
+管道，也可以这样调用：
+
+~~~sh
+printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
+    --login-server https://hs.example.com --auth-key-stdin join
+~~~
+
+`profile-add` 同样支持这两种输入方式；已注册到目标网络、无需重新登录时，
+脚本不会读取 stdin。
 
 `enable-subnet` 会自动从 `ubus` 读取 LAN 地址并正确计算网络 CIDR（例如
 192.168.10.129/25 → 192.168.10.128/25），随后停在"已广告、等待批准"
@@ -167,7 +185,7 @@ subnet router 需在新服务器重新批准。
 | `backup` | 双端 | 创建带 manifest 的私有时间戳快照，不停服务 |
 | `install` | 双端 | 全新安装（VPS：.deb；OpenWrt：opkg/apk 包 + tailscale-core） |
 | `apply` | 双端 | 幂等收敛：已满足的状态不会重做、不会无谓重启 |
-| `join` | OpenWrt | 用 `file:` auth key 注册，拒绝静默切换 ControlURL |
+| `join` | OpenWrt | 用 `file:` auth key（`--auth-key-file` 或 `--auth-key-stdin`）注册，拒绝静默切换 ControlURL |
 | `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 定优先级，`--delete-identity` 同时注销身份） |
 | `switch-to` | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验） |
 | `enable-failover` / `disable-failover` | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog |
@@ -182,7 +200,7 @@ subnet router 需在新服务器重新批准。
 常用参数：VPS 侧 `--domain`、`--expected-public-ip`、`--proxy`、
 `--listen/--metrics-listen/--grpc-listen`、`--version`、`--user`、
 `--expiration`、`--output`、`--node-id`、`--route`；OpenWrt 侧
-`--login-server`、`--auth-key-file`、`--service-mode`、`--accept-dns`、
+`--login-server`、`--auth-key-file`、`--auth-key-stdin`、`--service-mode`、`--accept-dns`、
 `--accept-routes`、`--subnet`、`--min-client-version`、`--priority`、
 `--delete-identity`，以及 enable-failover 的
 `--check-interval/--failure-threshold/--recovery-threshold/--failback/

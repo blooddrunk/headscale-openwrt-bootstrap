@@ -251,6 +251,76 @@ openwrt_write_state() {
     log_change "state.json updated: $(state_path_openwrt)"
 }
 
+# --- auth key input ---------------------------------------------------------
+
+openwrt_auth_key_require_source() {
+    # The caller must be a command that will actually perform a new login.
+    # stdin is intentionally accepted as an alternative to a pre-created file;
+    # the key is still handed to tailscale through its file: mechanism.
+    openwrt_auth_key_command=$1
+    if [ -z "$OPENWRT_AUTH_KEY_FILE" ] && [ "$OPENWRT_AUTH_KEY_STDIN" != 1 ]; then
+        die "$openwrt_auth_key_command requires --auth-key-file FILE or --auth-key-stdin"
+    fi
+}
+
+openwrt_auth_key_cleanup() {
+    if [ -n "${OPENWRT_AUTH_KEY_TEMP:-}" ]; then
+        rm -f "$OPENWRT_AUTH_KEY_TEMP" 2>/dev/null || true
+        if [ "${OPENWRT_AUTH_KEY_FILE:-}" = "$OPENWRT_AUTH_KEY_TEMP" ]; then
+            OPENWRT_AUTH_KEY_FILE=
+        fi
+        OPENWRT_AUTH_KEY_TEMP=
+    fi
+}
+
+openwrt_auth_key_prepare_stdin() {
+    [ "$OPENWRT_AUTH_KEY_STDIN" = 1 ] || return 0
+
+    OPENWRT_AUTH_KEY_TEMP=$(mktemp "${TMPDIR:-/tmp}/headscale-bootstrap-auth.XXXXXX") || \
+        die 'cannot create a temporary auth key file'
+    OPENWRT_AUTH_KEY_FILE=$OPENWRT_AUTH_KEY_TEMP
+    chmod 600 "$OPENWRT_AUTH_KEY_FILE" || {
+        openwrt_auth_key_cleanup
+        die 'cannot secure the temporary auth key file'
+    }
+
+    OPENWRT_AUTH_KEY_VALUE=
+    IFS= read -r OPENWRT_AUTH_KEY_VALUE
+    openwrt_auth_key_read_status=$?
+    if [ "$openwrt_auth_key_read_status" -ne 0 ] && [ -z "$OPENWRT_AUTH_KEY_VALUE" ]; then
+        openwrt_auth_key_cleanup
+        die 'no auth key was received on stdin'
+    fi
+    [ -n "$OPENWRT_AUTH_KEY_VALUE" ] || {
+        openwrt_auth_key_cleanup
+        die 'auth key received on stdin is empty'
+    }
+    printf '%s\n' "$OPENWRT_AUTH_KEY_VALUE" > "$OPENWRT_AUTH_KEY_FILE" || {
+        openwrt_auth_key_cleanup
+        die 'failed to write the temporary auth key file'
+    }
+    unset OPENWRT_AUTH_KEY_VALUE
+}
+
+openwrt_auth_key_remove_after_success() {
+    if [ "$OPENWRT_AUTH_KEY_STDIN" = 1 ]; then
+        openwrt_auth_key_cleanup
+        log_change 'temporary stdin auth key file removed after successful login'
+    else
+        rm -f "$OPENWRT_AUTH_KEY_FILE"
+        log_change 'auth key file removed after successful login'
+    fi
+}
+
+openwrt_auth_key_login_failed() {
+    if [ "$OPENWRT_AUTH_KEY_STDIN" = 1 ]; then
+        openwrt_auth_key_cleanup
+        log_warn 'the auth key read from stdin was not retained; retry with --auth-key-stdin'
+    else
+        log_warn "the auth key file was NOT deleted (it may still be usable): $OPENWRT_AUTH_KEY_FILE"
+    fi
+}
+
 # --- install / apply / join ----------------------------------------------
 
 openwrt_install() {
@@ -315,7 +385,7 @@ openwrt_join() {
     openwrt_refresh
     openwrt_client_version_gate
     bootstrap_is_https_url "$OPENWRT_EFFECTIVE_LOGIN_SERVER" || die 'join requires --login-server https://...'
-    [ -n "$OPENWRT_AUTH_KEY_FILE" ] || die 'join requires --auth-key-file FILE (mode 0400/0600)'
+    openwrt_auth_key_require_source join
 
     # Multi-Headscale guard: never silently switch ControlURL.
     if [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ] && [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] && \
@@ -353,18 +423,20 @@ EOF
         return 0
     fi
 
-    # Fresh login.  --reset is deliberately absent.
+    # Fresh login.  --reset is deliberately absent.  If stdin was selected,
+    # read it only now so an already-registered node never blocks for a key it
+    # will not use.
+    openwrt_auth_key_prepare_stdin
     tailscale up \
         --login-server="$OPENWRT_EFFECTIVE_LOGIN_SERVER" \
         --auth-key="file:$OPENWRT_AUTH_KEY_FILE" \
         --accept-dns="$OPENWRT_ACCEPT_DNS" \
         --accept-routes="$OPENWRT_ACCEPT_ROUTES" || {
         log_error 'tailscale up failed'
-        log_warn "the auth key file was NOT deleted (it may still be usable): $OPENWRT_AUTH_KEY_FILE"
+        openwrt_auth_key_login_failed
         exit 1
     }
-    rm -f "$OPENWRT_AUTH_KEY_FILE"
-    log_change 'auth key file removed after successful login'
+    openwrt_auth_key_remove_after_success
 
     openwrt_refresh
     openwrt_converge_prefs
@@ -862,7 +934,7 @@ openwrt_profile_list() {
 openwrt_profile_add() {
     openwrt_require_root_real
     bootstrap_is_https_url "$OPENWRT_LOGIN_SERVER" || die 'profile-add requires --login-server https://...'
-    [ -n "$OPENWRT_AUTH_KEY_FILE" ] || die 'profile-add requires --auth-key-file FILE (mode 0400/0600)'
+    openwrt_auth_key_require_source profile-add
     openwrt_refresh
     openwrt_client_version_gate
 
@@ -900,15 +972,15 @@ openwrt_profile_add() {
     else
         # tailscale login creates a NEW profile; it never reconfigures the
         # current one, so the active network is preserved until we switch back.
+        openwrt_auth_key_prepare_stdin
         tailscale login \
             --login-server="$openwrt_pa_target" \
             --auth-key="file:$OPENWRT_AUTH_KEY_FILE" || {
             log_error 'tailscale login failed'
-            log_warn "the auth key file was NOT deleted (it may still be usable): $OPENWRT_AUTH_KEY_FILE"
+            openwrt_auth_key_login_failed
             exit 1
         }
-        rm -f "$OPENWRT_AUTH_KEY_FILE"
-        log_change 'auth key file removed after successful login'
+        openwrt_auth_key_remove_after_success
 
         openwrt_refresh
         [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ] || \

@@ -26,6 +26,8 @@ OPENWRT_COMMAND=
 OPENWRT_POSITIONAL=
 OPENWRT_LOGIN_SERVER=
 OPENWRT_AUTH_KEY_FILE=
+OPENWRT_AUTH_KEY_STDIN=0
+OPENWRT_AUTH_KEY_TEMP=
 OPENWRT_HOSTNAME=
 OPENWRT_SERVICE_MODE=auto
 OPENWRT_ACCEPT_DNS=false
@@ -54,6 +56,13 @@ BOOTSTRAP_JSON=0
 BOOTSTRAP_QUIET=0
 BOOTSTRAP_VERBOSE=0
 
+# A stdin-supplied auth key is materialized only for the duration of the
+# login operation.  The cleanup trap also covers die/exit paths after the
+# temporary file has been created.
+trap 'openwrt_auth_key_cleanup' 0
+trap 'openwrt_auth_key_cleanup; exit 130' INT
+trap 'openwrt_auth_key_cleanup; exit 143' HUP TERM
+
 openwrt_usage() {
     cat <<'EOF'
 Usage:
@@ -73,13 +82,15 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
   apply                    Idempotent convergence: core service, fw4 zone
                            bound to device tailscale0, prefs via tailscale set.
   join                     Register with --login-server using --auth-key-file
-                           (file: key, no --reset); refuses a ControlURL switch.
+                           or --auth-key-stdin (file: key, no --reset);
+                           refuses a ControlURL switch.
   profile-list             Read-only: the managed profile list and failover
                            state from /etc/config/tailscale-bootstrap.
   profile-add              Register --login-server as an ADDITIONAL tailscale
                            profile (tailscale login; the active network is
-                           switched back afterwards) and record it with
-                           --priority (lower wins; default appends +10).
+                           switched back afterwards), using --auth-key-file or
+                           --auth-key-stdin, and record it with --priority
+                           (lower wins; default appends +10).
   profile-remove           Drop --login-server from the profile list; add
                            --delete-identity to also log that profile out.
   switch-to                Manually switch to --login-server (must already be
@@ -104,6 +115,8 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
 Options:
   --login-server URL
   --auth-key-file FILE     Path is checked, never read to stdout or logs.
+  --auth-key-stdin         Read one auth key line from stdin into a private
+                           temporary file; mutually exclusive with --auth-key-file.
   --hostname NAME
   --service-mode auto|core|native
   --accept-dns true|false
@@ -175,6 +188,9 @@ openwrt_validate_options() {
         https://?*) OPENWRT_LOGIN_SERVER=$(bootstrap_normalize_url "$OPENWRT_LOGIN_SERVER") ;;
         *) die '--login-server must be an HTTPS URL' ;;
     esac
+    if [ "$OPENWRT_AUTH_KEY_STDIN" = 1 ] && [ -n "$OPENWRT_AUTH_KEY_FILE" ]; then
+        die '--auth-key-file and --auth-key-stdin are mutually exclusive'
+    fi
     if [ -n "$OPENWRT_AUTH_KEY_FILE" ] && [ ! -f "$OPENWRT_AUTH_KEY_FILE" ]; then
         die "--auth-key-file is not a regular file: $OPENWRT_AUTH_KEY_FILE"
     fi
@@ -236,6 +252,7 @@ openwrt_parse_args() {
                 shift 2
                 ;;
             --auth-key-file=*) OPENWRT_AUTH_KEY_FILE=${1#*=}; shift ;;
+            --auth-key-stdin) OPENWRT_AUTH_KEY_STDIN=1; shift ;;
             --hostname)
                 openwrt_need_value "$@"
                 OPENWRT_HOSTNAME=$2

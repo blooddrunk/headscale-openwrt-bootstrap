@@ -2,7 +2,8 @@
 
 # Milestone 4 fixture tests: package install, dangerous helper handling
 # (disable only, never stop), tailscale-core deployment, first-stage fw4 zone
-# transaction, and join (file: auth key, no --reset, multi-Headscale guard).
+# transaction, and join (file/stdin auth key, no --reset,
+# multi-Headscale guard).
 
 set -eu
 
@@ -81,7 +82,7 @@ make_fresh_root() {
 }
 
 run_ow() {
-    env FAKE_OPENWRT_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$OPENWRT_BIN:$PATH" \
+    env FAKE_OPENWRT_ROOT="$ROOT" FAKE_LOG="$LOG" TMPDIR="$TMP_DIR" PATH="$OPENWRT_BIN:$PATH" \
         "$OPENWRT_SCRIPT" --root "$ROOT" "$@"
 }
 
@@ -193,6 +194,46 @@ OUT=$(run_ow --login-server "$LOGIN" --auth-key-file "$KEYFILE" join)
 assert_contains "$OUT" 'already registered'
 log_not_has 'tailscale up' || fail 'registered node must not run tailscale up again'
 [ -f "$KEYFILE" ] || fail 'unused key file must be kept'
+rm -f "$KEYFILE"
+
+# C2b. stdin auth key: the key is never present in argv/logs and the temporary
+# file is removed after the successful login.
+make_fresh_root ow-c2b
+run_ow --login-server "$LOGIN" install >/dev/null
+log_reset
+OUT=$(printf 'hskey-auth-FIXTURE-stdin\n' | run_ow --login-server "$LOGIN" --auth-key-stdin join)
+assert_contains "$OUT" 'Join complete'
+UP_LINE=$(grep -F 'tailscale up' "$LOG" | head -n 1)
+assert_contains "$UP_LINE" '--auth-key=file:'
+assert_not_contains "$UP_LINE" 'hskey-auth-FIXTURE-stdin'
+[ -z "$(find "$TMP_DIR" -maxdepth 1 -type f -name 'headscale-bootstrap-auth.*' -print -quit)" ] || \
+    fail 'stdin auth key temporary file must be removed after success'
+
+# C2c. stdin auth key is also cleaned up when authentication fails.
+make_fresh_root ow-c2c
+run_ow --login-server "$LOGIN" install >/dev/null
+set +e
+OUT=$(printf 'hskey-auth-FIXTURE-stdin-fail\n' | env FAKE_OPENWRT_ROOT="$ROOT" \
+    FAKE_FAIL_AUTH=1 FAKE_LOG="$LOG" TMPDIR="$TMP_DIR" PATH="$OPENWRT_BIN:$PATH" \
+    "$OPENWRT_SCRIPT" --root "$ROOT" --login-server "$LOGIN" --auth-key-stdin join 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'stdin auth failure must fail'
+assert_contains "$OUT" 'auth key read from stdin was not retained'
+[ -z "$(find "$TMP_DIR" -maxdepth 1 -type f -name 'headscale-bootstrap-auth.*' -print -quit)" ] || \
+    fail 'stdin auth key temporary file must be removed after failure'
+
+# C2d. The two input modes are mutually exclusive.
+make_fresh_root ow-c2d
+KEYFILE=$TMP_DIR/hs-auth-key-mutual
+printf 'hskey-auth-FIXTURE-mutual\n' > "$KEYFILE"
+chmod 600 "$KEYFILE"
+set +e
+OUT=$(run_ow --login-server "$LOGIN" --auth-key-file "$KEYFILE" --auth-key-stdin join 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'auth key input modes must be mutually exclusive'
+assert_contains "$OUT" 'mutually exclusive'
 rm -f "$KEYFILE"
 
 # C3. Auth failure: join fails, key file kept for inspection.

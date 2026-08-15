@@ -75,7 +75,7 @@ make_fresh_root() {
 }
 
 run_ow() {
-    env FAKE_OPENWRT_ROOT="$ROOT" FAKE_LOG="$LOG" OPENWRT_SWITCH_SETTLE=0 \
+    env FAKE_OPENWRT_ROOT="$ROOT" FAKE_LOG="$LOG" TMPDIR="$TMP_DIR" OPENWRT_SWITCH_SETTLE=0 \
         PATH="$OPENWRT_BIN:$PATH" \
         "$OPENWRT_SCRIPT" --root "$ROOT" "$@"
 }
@@ -145,10 +145,9 @@ assert_contains "$OUT" 'profiles: 1'
 assert_contains "$OUT" "$A [active]"
 
 # Second network: login creates a profile, then the script must switch back.
-new_key second
-OUT=$(run_ow --login-server "$B" --auth-key-file "$KEYFILE" profile-add)
+OUT=$(printf 'hskey-auth-FIXTURE-second-stdin\n' | \
+    run_ow --login-server "$B" --auth-key-stdin profile-add)
 assert_contains "$OUT" 'Profile added'
-[ ! -f "$KEYFILE" ] || fail 'second auth key file must be removed'
 assert_file_contains "$BOOTCFG" "option login_server '$B'"
 assert_file_contains "$BOOTCFG" "option priority '20'"
 assert_file_contains "$BOOTCFG" "option ts_profile 'user2'"
