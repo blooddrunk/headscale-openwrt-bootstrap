@@ -56,7 +56,7 @@ net_cidr_info() {
     '
 }
 
-# Print the normalized network address of IP/PREFIX (PLAN 24.1: never rewrite
+# Print the normalized network address of IP/PREFIX (never rewrite
 # ".1" to ".0" by hand).
 net_network_of() {
     net_network_ip=$1

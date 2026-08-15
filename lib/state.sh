@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Non-secret state.json management (PLAN section 34).  The state file only
+# Non-secret state.json management.  The state file only
 # records management facts.  It must never contain auth keys, API tokens,
 # Cloudflare tokens, tailscaled.state content, private keys, or database
 # credentials.

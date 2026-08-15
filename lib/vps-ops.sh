@@ -1,7 +1,7 @@
 #!/bin/sh
 
-# VPS mutating operations (PLAN Milestones 2, 3 and 6).  Every write follows
-# the transaction model from PLAN section 36:
+# VPS mutating operations.  Every write follows
+# the transaction model:
 #   discover -> validate -> backup -> prepare temp -> syntax check -> apply
 #   -> reload only the necessary service -> verify -> commit state
 # Any failure restores the backup and exits nonzero.
@@ -26,7 +26,7 @@ vps_conflict_or_die() {
     # plan) plus mutate-specific requirements.
     vps_refresh
     if [ "$VPS_ENABLE_DERP" = true ]; then
-        die 'embedded DERP enablement is not supported in this build (PLAN 2.1.6); refusing to proceed'
+        die 'embedded DERP enablement is not supported in this build; refusing to proceed'
     fi
     vps_compute_conflicts mutate
     if [ "$vps_plan_blocked" -eq 1 ]; then
@@ -100,7 +100,7 @@ vps_install_deb() {
 }
 
 vps_render_config() {
-    # vps_render_config SRC DST — rewrite only managed keys (PLAN 8.2).
+    # vps_render_config SRC DST — rewrite only the managed keys.
     # Everything else passes through byte for byte.  trusted_proxies is
     # normalized to the loopback block list; an existing block list is
     # consumed so no orphaned items remain.
@@ -398,7 +398,7 @@ vps_panel_required_directives() {
 
 vps_panel_prefix_present() {
     # A directive counts as present when any active line starts with the
-    # directive name (PLAN 9.4: never rewrite a verified $http_connection form).
+    # directive name (never rewrite a verified $http_connection form).
     vps_pp_prefix=$1
     vps_pp_text=$2
     printf '%s\n' "$vps_pp_text" | grep -qF "$vps_pp_prefix"
@@ -411,7 +411,7 @@ vps_apply_1panel() {
   - domain: $VPS_EFFECTIVE_DOMAIN
   - reverse proxy upstream: http://$VPS_LISTEN
   - TLS certificate for the domain (DNS Only, no Cloudflare proxy)
-This script does not create 1Panel sites or certificates (PLAN 9.2).
+This script does not create 1Panel sites or certificates.
 EOF
         exit 2
     }
@@ -696,7 +696,7 @@ vps_latest_stable_tag() {
 
 vps_update_steps() {
     # Print the ordered upgrade chain (stable minors, latest patch each;
-    # PLAN 2.1.10 / 13: never skip a stable minor).
+    # stable minors are never skipped).
     vps_steps_current=$1
     vps_steps_target=$2
     vps_steps_tags=$3
@@ -767,7 +767,7 @@ vps_backup_create() {
 }
 
 vps_update_step() {
-    # One PLAN 13 step: notes, stop, backup, download, verify, install, merge,
+    # One upgrade step: notes, stop, backup, download, verify, install, merge,
     # configtest, start, health, nodes list.
     vps_step_version=$1
     printf '\n=== Updating to %s ===\n' "$vps_step_version" >&2
@@ -908,7 +908,7 @@ vps_rollback_find() {
 
 vps_rollback_to() {
     # vps_rollback_to BACKUP_DIR — package/config/database are one consistent
-    # snapshot (PLAN 2.1.11 / 13).
+    # snapshot (package, config and data as one unit).
     vps_rb_dir=$1
     [ -d "$vps_rb_dir" ] || { log_error "rollback backup missing: $vps_rb_dir"; return 1; }
     [ ! -f "$vps_rb_dir/.INCOMPLETE" ] || { log_error "refusing to restore an INCOMPLETE backup: $vps_rb_dir"; return 1; }
@@ -1022,7 +1022,7 @@ vps_cleanup() {
     fi
 
     if [ "$VPS_PANEL_ROOT_PRESENT" = yes ] && [ "$VPS_PANEL_BUFFERING" = present ]; then
-        printf '1Panel site files were left untouched (PLAN 14); the proxy_buffering directive added by apply remains.\n'
+        printf '1Panel site files were left untouched; the proxy_buffering directive added by apply remains.\n'
     fi
 
     state_remove "$(state_path_vps)"

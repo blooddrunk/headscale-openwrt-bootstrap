@@ -3,7 +3,7 @@
 # Headscale + OpenWrt bootstrap, router side.
 #
 # discover/plan/status/verify stay read-only.  install/apply/join and the
-# subnet/WAN-UDP/update/rollback/cleanup commands follow the PLAN section 36
+# subnet/WAN-UDP/update/rollback/cleanup commands follow the transaction model:
 # transaction model and the ownership boundaries: netifd never manages
 # tailscale0, the dangerous stock init is only ever disabled (never stopped),
 # firewall writes go pending-UCI -> fw4 check -> commit -> firewall reload,
@@ -683,7 +683,7 @@ openwrt_print_discover() {
 }
 
 openwrt_compute_conflicts() {
-    # Shared hard guards for plan and every mutating command (PLAN 2.2, 33.2).
+    # Shared hard guards for plan and every mutating command (safety rules, single network).
     openwrt_conflicts_mode=${1:-plan}
     openwrt_plan_blocked=0
     openwrt_block_reasons=
@@ -721,7 +721,7 @@ openwrt_compute_conflicts() {
     fi
     if [ "$OPENWRT_EFFECTIVE_SERVICE_MODE" = core ] && [ "$OPENWRT_CORE_FINGERPRINT" = unverified ]; then
         # plan reports it; mutating commands repair it from the verified
-        # template instead of blocking (PLAN 28), backing up the file first.
+        # template instead of blocking, backing up the file first.
         if [ "$openwrt_conflicts_mode" = plan ]; then
             openwrt_plan_blocked=1
             openwrt_block_reasons="$openwrt_block_reasons unverified-tailscale-core"

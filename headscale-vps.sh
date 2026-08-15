@@ -3,7 +3,7 @@
 # Headscale + OpenWrt bootstrap, VPS side.
 #
 # discover/plan/status/verify stay read-only.  install/apply/update/rollback/
-# cleanup/purge and the user/key/route helpers follow the PLAN section 36
+# cleanup/purge and the user/key/route helpers follow the transaction model:
 # transaction model: backup before writing, validate before reloading, verify
 # after, restore on failure.
 
@@ -739,7 +739,7 @@ vps_print_discover() {
 
 vps_compute_conflicts() {
     # Shared hard guards for plan and every mutating command.  Keep in sync
-    # with PLAN sections 2.1, 7, 9 and 33.4 (one Headscale network per host).
+    # for ports/DNS/proxy safety and the one-Headscale-network-per-host rule.
     vps_conflicts_mode=${1:-plan}
     vps_plan_blocked=0
     vps_block_reasons=

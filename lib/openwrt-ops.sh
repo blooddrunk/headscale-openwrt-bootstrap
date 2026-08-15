@@ -1,10 +1,10 @@
 #!/bin/sh
 
-# OpenWrt mutating operations (PLAN Milestones 4, 5 and 6).  Ownership rules
+# OpenWrt mutating operations.  Ownership rules
 # that keep netifd, fw4, tailscaled and the LuCI helper from fighting:
 #   - netifd never manages tailscale0 (no network.tailscale, no network reload);
 #   - the dangerous stock /etc/init.d/tailscale is only ever disabled, never
-#     stopped/reloaded/restarted (PLAN 2.2.12, 18.2);
+#     stopped/reloaded/restarted;
 #   - firewall writes go: pending UCI -> fw4 check -> commit -> firewall reload;
 #   - the daemon runs through tailscale-core only; identity lives in
 #     /etc/tailscale/tailscaled.state and is never printed.
@@ -31,7 +31,7 @@ openwrt_conflict_or_die() {
 }
 
 openwrt_client_version_gate() {
-    # PLAN 17: stop when the client is older than the server's minimum.  The
+    # Stop when the client is older than the server's minimum.  The
     # threshold is passed in (--min-client-version) so it tracks the actual
     # Headscale release instead of being hardcoded.
     [ -n "$OPENWRT_MIN_CLIENT_VERSION" ] || return 0
@@ -78,7 +78,7 @@ openwrt_init_action() {
     return 0
 }
 
-# --- UCI transaction helpers (PLAN 2.2.8/9, 23, 25) ----------------------
+# --- UCI transaction helpers ----------------------------------------------
 
 openwrt_uci_ensure_section() {
     # openwrt_uci_ensure_section PATH TYPE; returns 0 when staged, 1 no-op.
@@ -132,7 +132,7 @@ openwrt_firewall_commit_or_revert() {
 }
 
 openwrt_firewall_ensure_zone() {
-    # First-stage zone bound directly to the tailscale0 device (PLAN 23).
+    # Zone bound directly to the tailscale0 device (no netifd interface).
     openwrt_fwz_changed=0
     openwrt_uci_ensure_section firewall.tailscale zone && openwrt_fwz_changed=1
     openwrt_uci_ensure_option firewall.tailscale.name tailscale && openwrt_fwz_changed=1
@@ -153,7 +153,7 @@ openwrt_firewall_ensure_forwarding() {
 }
 
 openwrt_firewall_ensure_wan_udp_rule() {
-    # Narrow, reversible WAN input rule (PLAN 27): UDP only, the port
+    # Narrow, reversible WAN input rule: UDP only, the port
     # tailscaled actually listens on, no port forwarding.
     openwrt_wur_changed=0
     openwrt_uci_ensure_section firewall.ts_wan_udp rule && openwrt_wur_changed=1
@@ -207,7 +207,7 @@ openwrt_ensure_core() {
         log_change 'enabled tailscale-core at boot'
     fi
 
-    # Stock service handling: disable only, and never stop it (PLAN 18.2).
+    # Stock service handling: disable only, and never stop it.
     if [ "$OPENWRT_UNSAFE_LUCI_HELPER" = yes ]; then
         if [ "$OPENWRT_STOCK_SERVICE_ENABLED" = yes ]; then
             openwrt_init_action tailscale disable || die 'failed to disable the unsafe stock tailscale service'
@@ -256,7 +256,7 @@ openwrt_install() {
     openwrt_ensure_core
     openwrt_ensure_daemon_running
 
-    # Daemon start must not leave network/firewall UCI dirty (PLAN 20).
+    # Daemon start must not leave network/firewall UCI dirty.
     if [ "$(uci changes network 2>/dev/null | wc -l)" != 0 ] || [ "$(uci changes firewall 2>/dev/null | wc -l)" != 0 ]; then
         die 'pending network/firewall UCI changes after daemon start; investigate before continuing'
     fi
@@ -267,7 +267,7 @@ openwrt_install() {
 }
 
 openwrt_converge_prefs() {
-    # Idempotent prefs via `tailscale set` only (PLAN 22); never advertise here.
+    # Idempotent prefs via `tailscale set` only; never advertise routes here.
     [ "$OPENWRT_PREFS_READABLE" = yes ] || return 0
     openwrt_cp_changed=0
     if [ "$OPENWRT_CURRENT_ACCEPT_DNS" != "$OPENWRT_ACCEPT_DNS" ]; then
@@ -314,7 +314,7 @@ openwrt_join() {
     bootstrap_is_https_url "$OPENWRT_EFFECTIVE_LOGIN_SERVER" || die 'join requires --login-server https://...'
     [ -n "$OPENWRT_AUTH_KEY_FILE" ] || die 'join requires --auth-key-file FILE (mode 0400/0600)'
 
-    # Multi-Headscale guard (PLAN 33.2): never silently switch ControlURL.
+    # Multi-Headscale guard: never silently switch ControlURL.
     if [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ] && [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] && \
         [ "$OPENWRT_CURRENT_CONTROL_URL" != "$OPENWRT_EFFECTIVE_LOGIN_SERVER" ]; then
         cat >&2 <<EOF
@@ -350,7 +350,7 @@ EOF
         return 0
     fi
 
-    # Fresh login.  --reset is deliberately absent (PLAN 2.2.4, 21).
+    # Fresh login.  --reset is deliberately absent.
     tailscale up \
         --login-server="$OPENWRT_EFFECTIVE_LOGIN_SERVER" \
         --auth-key="file:$OPENWRT_AUTH_KEY_FILE" \
@@ -382,7 +382,7 @@ openwrt_join_verify() {
     log_check "join verified: ControlURL=$OPENWRT_CURRENT_CONTROL_URL IP=$OPENWRT_TAILSCALE_IP4 UCI clean"
 }
 
-# --- subnet router (PLAN 24/25/41) ---------------------------------------
+# --- subnet router ---------------------------------------------------------
 
 openwrt_discover_lan_cidr() {
     bootstrap_command_exists ubus || return 1
@@ -395,12 +395,12 @@ openwrt_discover_lan_cidr() {
     openwrt_lan_mask=$(printf '%s\n' "$openwrt_lan_obj" | sed -n 's/.*"mask"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
     [ -n "$openwrt_lan_ip" ] && [ -n "$openwrt_lan_mask" ] || return 1
     net_is_ipv4 "$openwrt_lan_ip" || return 1
-    # Proper CIDR math, never a naive .1 -> .0 rewrite (PLAN 24.1).
+    # Proper CIDR math, never a naive .1 -> .0 rewrite.
     printf '%s/%s\n' "$(net_network_of "$openwrt_lan_ip" "$openwrt_lan_mask")" "$openwrt_lan_mask"
 }
 
 openwrt_subnet_hard_checks() {
-    # PLAN 41: the CGNAT and ULA ranges must never be advertised as a LAN.
+    # The CGNAT and ULA ranges must never be advertised as a LAN.
     net_cidr_contains 100.64.0.0/10 "$1" && die "$1 is inside the Tailscale CGNAT range 100.64.0.0/10"
     net_cidr_contains "$1" 100.64.0.0/10 && die "$1 contains the Tailscale CGNAT range 100.64.0.0/10"
     case "$1" in
@@ -463,7 +463,7 @@ openwrt_enable_subnet() {
     cat <<EOF
 Subnet router advertised: $OPENWRT_SUBNET
 Status: advertised, awaiting approval on the Headscale server.
-Approve it there (PLAN 24.3), e.g.:
+Approve it there, e.g.:
   headscale nodes list-routes
   headscale nodes approve-routes --identifier <NODE_ID> --routes $OPENWRT_SUBNET
 or from the VPS: headscale-vps.sh approve-route --node-id <NODE_ID> --route $OPENWRT_SUBNET
@@ -529,7 +529,7 @@ openwrt_allow_wan_udp() {
     fi
 }
 
-# --- update / rollback / cleanup / purge (PLAN 28-30) --------------------
+# --- update / rollback / cleanup / purge -----------------------------------
 
 openwrt_backup_create() {
     openwrt_refresh
@@ -585,7 +585,7 @@ openwrt_update() {
     esac
 
     # Re-run the helper fingerprint after the package touched the filesystem
-    # and make sure the stock service stays disabled when unsafe (PLAN 28).
+    # and make sure the stock service stays disabled when unsafe.
     openwrt_refresh
     openwrt_ensure_core
     openwrt_init_action tailscale-core restart || die 'failed to restart tailscale-core (only tailscale-core is restarted)'

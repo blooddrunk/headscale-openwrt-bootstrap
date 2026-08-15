@@ -4,9 +4,8 @@
 控制服务器，并在一台 OpenWrt/Kwrt 路由器上把 Tailscale 客户端接入它——
 通过两个脚本完成安装、配置、更新、校验、回退和清理。
 
-项目基于一次真实部署验证过的基线（Headscale 0.29.3、Tailscale 1.98.3、
-Kwrt 25.12 / fw4、Debian 13、1Panel OpenResty），基线文件原样保留在
-`reference/` 中。完整的实施规格与安全约束见 [PLAN.md](PLAN.md)。
+项目在真实环境中按以下版本组合验证过：Headscale 0.29.3、Tailscale
+1.98.3、Kwrt/OpenWrt 25.12（fw4/nftables）、Debian 13、1Panel OpenResty。
 
 ## 为什么安全
 
@@ -214,9 +213,7 @@ headscale-vps.sh        VPS 端入口
 tailscale-openwrt.sh    OpenWrt 端入口
 lib/                    共享库与两端操作实现
 templates/              tailscale-core 服务与反代配置模板
-reference/              已验证基线文件（Headscale/1Panel/Tailscale/fw4）
-tests/                  fixture 测试与假命令
-PLAN.md                 完整实施规格与安全约束
+tests/                  fixture 测试与假命令（均为合成数据）
 ~~~
 
 ## 已知边界
@@ -226,7 +223,7 @@ PLAN.md                 完整实施规格与安全约束
 - nginx 模式不负责申请证书。
 - 不支持同时连接多个 Headscale 网络（官方客户端同一时刻只有一个活动
   tailnet）；如需两个独立网络，请部署两个 Headscale 实例并在客户端切换。
-- 路由器真机重启后的完整验收（PLAN §31）建议人工执行一次；脚本已提供
-  `status` 作为重启后的自动检查。
+- 路由器真机重启后的完整验收建议人工执行一次（重启后运行 `status`
+  即为自动检查）。
 - LuCI 界面里的"启用/停止/重启 Tailscale"按钮在本部署中不可用，daemon
   由 `tailscale-core` 管理。
