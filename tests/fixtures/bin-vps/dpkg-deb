@@ -28,11 +28,20 @@ done
 deb_version=$(sed -n 's/^FAKEDEB //p' "$deb_file" | sed -n '1p')
 [ -n "$deb_version" ] || { printf 'dpkg-deb: not a fixture package\n' >&2; exit 1; }
 
+# Mirror real dpkg-deb --field behavior: a single requested field prints the
+# bare value, multiple fields print "Field: value" lines.
 [ -z "$fields" ] && fields=' Package Version'
+field_count=0
+for field in $fields; do field_count=$((field_count + 1)); done
 for field in $fields; do
     case "$field" in
-        Package) printf 'headscale\n' ;;
-        Version) printf '%s\n' "$deb_version" ;;
-        *) printf '\n' ;;
+        Package) value=headscale ;;
+        Version) value=$deb_version ;;
+        *) value= ;;
     esac
+    if [ "$field_count" -gt 1 ]; then
+        printf '%s: %s\n' "$field" "$value"
+    else
+        printf '%s\n' "$value"
+    fi
 done

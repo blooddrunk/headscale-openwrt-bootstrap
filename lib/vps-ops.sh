@@ -77,12 +77,16 @@ vps_deb_metadata_ok() {
     # vps_deb_metadata_ok FILE EXPECTED_VERSION
     vps_deb_file=$1
     vps_deb_expected=$2
-    vps_deb_fields=$(dpkg-deb --field "$vps_deb_file" Package Version 2>/dev/null) || {
+    # dpkg-deb prefixes each requested field name when more than one field is
+    # queried at a time; single-field queries print the bare value.
+    vps_deb_package=$(dpkg-deb --field "$vps_deb_file" Package 2>/dev/null) || {
         log_error 'dpkg-deb metadata validation failed'
         return 1
     }
-    vps_deb_package=$(printf '%s\n' "$vps_deb_fields" | sed -n '1p')
-    vps_deb_version=$(printf '%s\n' "$vps_deb_fields" | sed -n '2p')
+    vps_deb_version=$(dpkg-deb --field "$vps_deb_file" Version 2>/dev/null) || {
+        log_error 'dpkg-deb metadata validation failed'
+        return 1
+    }
     if [ "$vps_deb_package" != headscale ] || [ "$vps_deb_version" != "$vps_deb_expected" ]; then
         log_error "package metadata mismatch: got package=$vps_deb_package version=$vps_deb_version, expected headscale $vps_deb_expected"
         return 1
