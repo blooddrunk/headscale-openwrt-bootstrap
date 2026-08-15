@@ -1251,6 +1251,41 @@ openwrt_switch_to() {
 
     openwrt_profile_guard
 
+    openwrt_st_name=$(openwrt_profiles_get_field "$openwrt_st_target" 4)
+    openwrt_st_id=$(openwrt_profiles_get_field "$openwrt_st_target" 5)
+
+    # The recorded entry can go stale: an older script may have stored the
+    # table header (ts_profile Account, ts_id ID), or the record may come
+    # from another device.  A wrong ts_id matches nothing and an ambiguous
+    # account name can match the wrong profile, so resolve the target from
+    # the live profile list, whose Tailnet column is unambiguous, and heal
+    # the UCI record when it disagrees.  A lookup miss is not fatal: tailnet
+    # display names do not always equal the login-server host.
+    openwrt_ensure_daemon_running
+    openwrt_st_list=$(tailscale switch --list 2>/dev/null || :)
+    openwrt_st_live=$(openwrt_ts_entries_strict_for_url "$openwrt_st_list" "$openwrt_st_target" | sed -n '1p')
+    if [ -n "$openwrt_st_live" ]; then
+        openwrt_st_fields=$(openwrt_ts_entry_fields "$openwrt_st_live")
+        openwrt_st_live_name=${openwrt_st_fields%%|*}
+        openwrt_st_live_id=${openwrt_st_fields#*|}
+        if [ -n "$openwrt_st_live_name" ] && \
+            { [ "$openwrt_st_live_id" != "$openwrt_st_id" ] || [ "$openwrt_st_live_name" != "$openwrt_st_name" ]; }; then
+            log_change "healed profile entry for $openwrt_st_target from the live list: ts_profile $openwrt_st_live_name, ts_id $openwrt_st_live_id"
+            uci set "$OPENWRT_UCI_TSBOOT.$openwrt_st_section.ts_profile=$openwrt_st_live_name" || die 'uci set ts_profile failed'
+            if [ -n "$openwrt_st_live_id" ]; then
+                uci set "$OPENWRT_UCI_TSBOOT.$openwrt_st_section.ts_id=$openwrt_st_live_id" || die 'uci set ts_id failed'
+            else
+                openwrt_uci_delete_if_exists "$OPENWRT_UCI_TSBOOT.$openwrt_st_section.ts_id" || true
+            fi
+            uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+            openwrt_st_name=$openwrt_st_live_name
+            openwrt_st_id=$openwrt_st_live_id
+        fi
+    fi
+
+    [ -n "$openwrt_st_name" ] || [ -n "$openwrt_st_id" ] || \
+        die "profile entry for $openwrt_st_target lacks ts_profile/ts_id; re-add it via profile-add"
+
     if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_st_target" ]; then
         openwrt_converge_prefs
         openwrt_write_state
@@ -1258,12 +1293,6 @@ openwrt_switch_to() {
         return 0
     fi
 
-    openwrt_st_name=$(openwrt_profiles_get_field "$openwrt_st_target" 4)
-    openwrt_st_id=$(openwrt_profiles_get_field "$openwrt_st_target" 5)
-    [ -n "$openwrt_st_name" ] || [ -n "$openwrt_st_id" ] || \
-        die "profile entry for $openwrt_st_target lacks ts_profile/ts_id; re-add it via profile-add"
-
-    openwrt_ensure_daemon_running
     openwrt_ts_switch "$openwrt_st_name" "$openwrt_st_id" || die "tailscale switch to $openwrt_st_name failed"
 
     openwrt_refresh

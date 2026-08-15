@@ -239,6 +239,30 @@ assert_contains "$OUT" "Switched to: $B"
 run_ow --login-server "$A" switch-to >/dev/null
 [ "$(cur_url)" = "$A" ] || fail "switch back to A failed: $(cur_url)"
 
+# A record poisoned by the old script (ts_profile Account, ts_id ID) must be
+# healed from the live list instead of breaking switch-to.
+uci_admin set tailscale-bootstrap.hs_b_example_com.ts_profile=Account
+uci_admin set tailscale-bootstrap.hs_b_example_com.ts_id=ID
+uci_admin commit tailscale-bootstrap
+OUT=$(run_ow --login-server "$B" switch-to 2>&1)
+assert_contains "$OUT" "Switched to: $B"
+[ "$(cur_url)" = "$B" ] || fail "switch-to must heal a poisoned record and succeed: $(cur_url)"
+assert_file_contains "$BOOTCFG" "option ts_profile 'home'"
+assert_file_contains "$BOOTCFG" "option ts_id '0102'"
+assert_contains "$OUT" 'healed profile entry'
+
+run_ow --login-server "$A" switch-to >/dev/null
+[ "$(cur_url)" = "$A" ] || fail "switch back to A failed after heal: $(cur_url)"
+
+# The already-active path must heal too, or the workaround "switch manually,
+# then run switch-to" would leave the poison in place for the watchdog.
+uci_admin set tailscale-bootstrap.hs_example_com.ts_id=stale
+uci_admin commit tailscale-bootstrap
+OUT=$(run_ow --login-server "$A" switch-to 2>&1)
+assert_contains "$OUT" 'Already active'
+assert_file_contains "$BOOTCFG" "option ts_id '0101'"
+assert_contains "$OUT" 'healed profile entry'
+
 ROOT=$TMP_DIR/owf-a
 reset_bootcfg
 
