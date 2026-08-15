@@ -97,10 +97,22 @@ vps install >/dev/null
 OUT=$(vps ensure-user --user home)
 assert_contains "$OUT" 'User home created'
 USERS=$VROOT/.headscale-state/users
-assert_file_contains "$USERS" '1|home'
+assert_file_contains "$USERS" '1||home'
 OUT=$(vps ensure-user --user home)
 assert_contains "$OUT" 'already exists'
 [ "$(wc -l < "$USERS")" = 1 ] || fail 'ensure-user must not create duplicates'
+
+# Regression (Headscale >= 0.26 table): users that already exist outside this
+# script must be matched via the Username column (display name may differ or be
+# empty), never re-created (UNIQUE constraint on users.name).
+printf '2|Family Room|cabin|\n3||attic|\n' >> "$USERS"
+OUT=$(vps ensure-user --user cabin)
+assert_contains "$OUT" 'already exists'
+OUT=$(vps ensure-user --user attic)
+assert_contains "$OUT" 'already exists'
+[ "$(wc -l < "$USERS")" = 3 ] || fail 'ensure-user must not duplicate pre-existing users'
+OUT=$(vps issue-key --user attic)
+printf '%s\n' "$OUT" | grep -qF 'hskey-auth-FIXTURE3' || fail 'issue-key must resolve a pre-existing user by username'
 
 OUT=$(vps issue-key --user home)
 KEY=$(printf '%s\n' "$OUT" | grep -F 'hskey-auth' | sed -n '1p')

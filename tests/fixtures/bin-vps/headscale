@@ -62,17 +62,22 @@ case "$cmd" in
     users)
         case "${cmd_sub:-list}" in
             list)
-                printf 'ID | Name | Created at\n'
+                # Headscale >= 0.26 table: "Name" is the display name (empty
+                # for plain `users create`), the username lives in "Username".
+                printf 'ID | Name | Username | Email | Created\n'
                 if [ -f "$STATE/users" ]; then
-                    awk -F'|' '{printf "%s | %s | 2026-01-01\n", $1, $2}' "$STATE/users"
+                    awk -F'|' '{printf "%s | %s | %s | %s | 2026-01-01\n", $1, $2, $3, $4}' "$STATE/users"
                 fi
                 ;;
             create)
                 create_name=$3
                 [ -n "$create_name" ] || { printf 'users create needs a name\n' >&2; exit 1; }
-                grep -qF "|$create_name" "$STATE/users" 2>/dev/null && { printf 'user already exists\n' >&2; exit 1; }
+                if awk -F'|' -v n="$create_name" '$3 == n { found = 1 } END { exit found ? 0 : 1 }' "$STATE/users" 2>/dev/null; then
+                    printf 'Error: creating user: constraint failed: UNIQUE constraint failed: users.name (2067)\n' >&2
+                    exit 1
+                fi
                 next_id=$(awk 'END { print NR + 1 }' "$STATE/users" 2>/dev/null || printf 1)
-                printf '%s|%s\n' "$next_id" "$create_name" >> "$STATE/users"
+                printf '%s||%s|\n' "$next_id" "$create_name" >> "$STATE/users"
                 printf 'User created\n'
                 ;;
             *) exit 1 ;;

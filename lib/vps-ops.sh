@@ -585,17 +585,24 @@ vps_apply_nginx() {
 
 vps_user_id_for() {
     # vps_user_id_for USERS_LIST NAME -> prints the id, exits nonzero if absent.
-    # `headscale users list` renders a pipe-separated table; fields carry padding.
-    printf '%s\n' "$1" | awk -F'|' -v u="$2" '
-        {
-            gsub(/[[:space:]]/, "", $2)
-            if ($2 == u) {
-                gsub(/[[:space:]]/, "", $1)
-                print $1
-                found = 1
-                exit
+    # `headscale users list` renders a pipe-separated table; fields carry
+    # padding.  Since Headscale 0.26 the "Name" column holds the display name
+    # (empty for plain `users create`) and the username lives in "Username";
+    # older releases kept the username in "Name".  Locate the column from the
+    # header so both layouts match, or creating an existing user fails with a
+    # UNIQUE constraint on users.name.
+    printf '%s\n' "$1" | awk -F'|' -v wanted="$2" '
+        function field(n, s) { s = $n; gsub(/[[:space:]]/, "", s); return s }
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                col = tolower(field(i))
+                if (col == "username") name_col = i
+                else if (col == "name" && name_col == 0) name_col = i
             }
+            if (name_col == 0) name_col = 2
+            next
         }
+        field(name_col) == wanted { print field(1); found = 1; exit }
         END { exit(found ? 0 : 1) }
     '
 }
