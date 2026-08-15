@@ -7,9 +7,11 @@ case "$*" in
         printf '{"model":"fixture-router","release":{"distribution":"Kwrt","version":"25.12-SNAPSHOT"}}\n'
         ;;
     'call network.interface.lan status')
+        # Real ubus pretty-prints JSON across lines with a bare numeric mask;
+        # per-line parsers must compact it first (or use jsonfilter).
         lan_ip=${FAKE_LAN_IP:-192.168.10.1}
         lan_mask=${FAKE_LAN_MASK:-24}
-        printf '{"uptime":123,"type":"bridge","l3_device":"br-lan","proto":"static","ipv4-address":[{"address":"%s","mask":"%s"}],"route":[{"target":"192.168.10.0","mask":24}],"inactive":null}\n' "$lan_ip" "$lan_mask"
+        printf '{\n\t"up": true,\n\t"pending": false,\n\t"uptime": 123,\n\t"type": "bridge",\n\t"l3_device": "br-lan",\n\t"proto": "static",\n\t"ipv4-address": [\n\t\t{\n\t\t\t"address": "%s",\n\t\t\t"mask": %s\n\t\t}\n\t],\n\t"route": [\n\t\t{\n\t\t\t"target": "192.168.10.0",\n\t\t\t"mask": 24,\n\t\t\t"nexthop": "0.0.0.0"\n\t\t}\n\t],\n\t"inactive": null\n}\n' "$lan_ip" "$lan_mask"
         ;;
     *) exit 0 ;;
 esac

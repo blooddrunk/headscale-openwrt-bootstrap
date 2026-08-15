@@ -502,12 +502,27 @@ openwrt_join_verify() {
 openwrt_discover_lan_cidr() {
     bootstrap_command_exists ubus || return 1
     openwrt_lan_json=$(ubus call network.interface.lan status 2>/dev/null) || return 1
-    # Parse inside the ipv4-address object only; a route object later in the
-    # same JSON also carries a "mask" field that must not win a greedy match.
-    openwrt_lan_obj=$(printf '%s\n' "$openwrt_lan_json" | sed -n 's/.*"ipv4-address"[[:space:]]*:[[:space:]]*\[{[[:space:]]*\([^]}]*\).*/\1/p' | sed -n '1p')
-    [ -n "$openwrt_lan_obj" ] || return 1
-    openwrt_lan_ip=$(printf '%s\n' "$openwrt_lan_obj" | sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
-    openwrt_lan_mask=$(printf '%s\n' "$openwrt_lan_obj" | sed -n 's/.*"mask"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    [ -n "$openwrt_lan_json" ] || return 1
+    openwrt_lan_ip=
+    openwrt_lan_mask=
+    # Real ubus pretty-prints JSON across multiple lines (the ipv4-address
+    # "[{" spans lines, which per-line sed can never match), so prefer
+    # jsonfilter from the OpenWrt base install.
+    if bootstrap_command_exists jsonfilter; then
+        openwrt_lan_ip=$(printf '%s\n' "$openwrt_lan_json" | jsonfilter -e '@.ipv4-address[0].address' 2>/dev/null | sed -n '1p')
+        openwrt_lan_mask=$(printf '%s\n' "$openwrt_lan_json" | jsonfilter -e '@.ipv4-address[0].mask' 2>/dev/null | sed -n '1p')
+    fi
+    if [ -z "$openwrt_lan_ip" ] || [ -z "$openwrt_lan_mask" ]; then
+        # Fallback without jsonfilter: compact to one line first, then parse
+        # inside the ipv4-address object only; a route object later in the
+        # same JSON also carries a "mask" field that must not win a greedy
+        # match.  The mask is a bare number in real ubus output.
+        openwrt_lan_flat=$(printf '%s\n' "$openwrt_lan_json" | tr -d '\n\t\r')
+        openwrt_lan_obj=$(printf '%s\n' "$openwrt_lan_flat" | sed -n 's/.*"ipv4-address"[[:space:]]*:[[:space:]]*\[{[[:space:]]*\([^]}]*\).*/\1/p' | sed -n '1p')
+        [ -n "$openwrt_lan_obj" ] || return 1
+        openwrt_lan_ip=$(printf '%s\n' "$openwrt_lan_obj" | sed -n 's/.*"address"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+        openwrt_lan_mask=$(printf '%s\n' "$openwrt_lan_obj" | sed -n 's/.*"mask"[[:space:]]*:[[:space:]]*"\{0,1\}\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+    fi
     [ -n "$openwrt_lan_ip" ] && [ -n "$openwrt_lan_mask" ] || return 1
     net_is_ipv4 "$openwrt_lan_ip" || return 1
     # Proper CIDR math, never a naive .1 -> .0 rewrite.
