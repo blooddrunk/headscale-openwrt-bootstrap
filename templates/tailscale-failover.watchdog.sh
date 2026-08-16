@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# TS_FAILOVER_WATCHDOG_v2
+# TS_FAILOVER_WATCHDOG_v3
 #
 # Deployed by headscale-openwrt-bootstrap as /usr/sbin/tailscale-failover.
 # The bootstrap script fingerprint-checks this file before every start;
@@ -74,6 +74,10 @@ failover_read_config() {
         }
         type == "failover" && $1 == "option" {
             print "setting:" unq($2) "=" unq($3)
+            next
+        }
+        type == "site_to_site" && $1 == "option" && unq($2) == "enabled" {
+            print "setting:s2s=" unq($3)
             next
         }
         END { flush() }
@@ -195,8 +199,15 @@ failover_switch() {
     fi
 
     # Per-profile prefs: keep the bootstrap safety posture on every network.
-    tailscale set --accept-dns=false --accept-routes=false >/dev/null 2>&1 || \
-        failover_log 'tailscale set accept-dns/accept-routes failed on the new profile'
+    # site_to_site mode (enable-site-to-site) intentionally keeps
+    # accept-routes on so remote subnets survive a failover switch too.
+    if [ "$(failover_setting s2s)" = 1 ]; then
+        tailscale set --accept-dns=false --accept-routes=true >/dev/null 2>&1 || \
+            failover_log 'tailscale set accept-dns/accept-routes failed on the new profile'
+    else
+        tailscale set --accept-dns=false --accept-routes=false >/dev/null 2>&1 || \
+            failover_log 'tailscale set accept-dns/accept-routes failed on the new profile'
+    fi
 
     failover_set_badswitch "$failover_sw_section" 0
     printf '%s\n' "$(date +%s 2>/dev/null || printf 0)" > "$RUNTIME_DIR/last_switch"

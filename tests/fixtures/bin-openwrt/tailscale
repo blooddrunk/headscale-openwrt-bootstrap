@@ -21,8 +21,11 @@ prefs_get() {
 }
 
 write_prefs() {
+    # Strip any quotes first: cur_advertised is captured between the array
+    # brackets (quotes included), so re-quoting an already-quoted value would
+    # double them on the second consecutive `tailscale set`.
     if [ -n "$4" ]; then
-        wp_quoted=$(printf '%s\n' "$4" | sed 's/,[[:space:]]*/","/g; s/^/"/; s/$/"/')
+        wp_quoted=$(printf '%s\n' "$4" | sed 's/"//g; s/,[[:space:]]*/","/g; s/^/"/; s/$/"/')
     else
         wp_quoted=
     fi

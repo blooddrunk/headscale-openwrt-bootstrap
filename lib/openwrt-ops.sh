@@ -216,6 +216,18 @@ openwrt_firewall_ensure_forwarding() {
     return 0
 }
 
+openwrt_firewall_ensure_lan_to_ts() {
+    # Site-to-site return path: LAN clients may reach tailnet nodes and the
+    # remote subnets other routers advertise.  Same fixed-name transaction
+    # rules as ts_to_lan; still no masquerade on the tailscale zone.
+    openwrt_fwlt_changed=0
+    openwrt_uci_ensure_section firewall.lan_to_ts forwarding && openwrt_fwlt_changed=1
+    openwrt_uci_ensure_option firewall.lan_to_ts.src lan && openwrt_fwlt_changed=1
+    openwrt_uci_ensure_option firewall.lan_to_ts.dest tailscale && openwrt_fwlt_changed=1
+    openwrt_uci_ensure_option firewall.lan_to_ts.family ipv4 && openwrt_fwlt_changed=1
+    return 0
+}
+
 openwrt_firewall_ensure_wan_udp_rule() {
     # Narrow, reversible WAN input rule: UDP only, the port
     # tailscaled actually listens on, no port forwarding.
@@ -392,11 +404,13 @@ openwrt_ensure_daemon_running() {
 
 openwrt_write_state() {
     openwrt_load_profiles
+    openwrt_load_site_to_site
     state_write "$(state_path_openwrt)" \
         service_mode "$OPENWRT_EFFECTIVE_SERVICE_MODE" \
         login_server "$OPENWRT_EFFECTIVE_LOGIN_SERVER" \
         subnets "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}" \
         firewall_zone tailscale \
+        site_to_site "$OPENWRT_S2S_ENABLED" \
         profiles "${OPENWRT_PROFILE_URLS:-none}" \
         failover_enabled "$OPENWRT_FAILOVER_ENABLED" || die 'failed to write state.json'
     log_change "state.json updated: $(state_path_openwrt)"
@@ -492,6 +506,9 @@ openwrt_install() {
 
 openwrt_converge_prefs() {
     # Idempotent prefs via `tailscale set` only; never advertise routes here.
+    # accept-routes targets the enabled mode: with site-to-site on, RouteAll
+    # must stay true so apply/join/switch-to/profile-add never silently undo
+    # it (disable-site-to-site is the explicit way back to false).
     [ "$OPENWRT_PREFS_READABLE" = yes ] || return 0
     openwrt_cp_changed=0
     if [ "$OPENWRT_CURRENT_ACCEPT_DNS" != "$OPENWRT_ACCEPT_DNS" ]; then
@@ -499,10 +516,11 @@ openwrt_converge_prefs() {
         openwrt_cp_changed=1
         log_change "accept-dns converged to $OPENWRT_ACCEPT_DNS"
     fi
-    if [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" != "$OPENWRT_ACCEPT_ROUTES" ]; then
-        tailscale set --accept-routes="$OPENWRT_ACCEPT_ROUTES" || die 'tailscale set --accept-routes failed'
+    openwrt_cp_routes_target=${OPENWRT_EFFECTIVE_ACCEPT_ROUTES:-$OPENWRT_ACCEPT_ROUTES}
+    if [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" != "$openwrt_cp_routes_target" ]; then
+        tailscale set --accept-routes="$openwrt_cp_routes_target" || die 'tailscale set --accept-routes failed'
         openwrt_cp_changed=1
-        log_change "accept-routes converged to $OPENWRT_ACCEPT_ROUTES"
+        log_change "accept-routes converged to $openwrt_cp_routes_target"
     fi
     return 0
 }
@@ -514,6 +532,13 @@ openwrt_apply() {
     openwrt_ensure_daemon_running
 
     openwrt_firewall_ensure_zone
+    # Mode-aware heal: with site-to-site enabled, apply also repairs the
+    # forwardings it requires (a forwarding must never reference a missing
+    # zone, and both directions belong to the enabled mode).
+    if [ "$OPENWRT_S2S_ENABLED" = yes ]; then
+        openwrt_firewall_ensure_forwarding
+        openwrt_firewall_ensure_lan_to_ts
+    fi
     openwrt_firewall_commit_or_revert
 
     openwrt_refresh
@@ -562,6 +587,10 @@ EOF
     openwrt_ensure_core
     openwrt_ensure_daemon_running
     openwrt_firewall_ensure_zone
+    if [ "$OPENWRT_S2S_ENABLED" = yes ]; then
+        openwrt_firewall_ensure_forwarding
+        openwrt_firewall_ensure_lan_to_ts
+    fi
     openwrt_firewall_commit_or_revert
 
     openwrt_refresh
@@ -660,12 +689,9 @@ openwrt_subnet_hard_checks() {
     fi
 }
 
-openwrt_enable_subnet() {
-    openwrt_require_root_real
-    openwrt_conflict_or_die
-    [ "$OPENWRT_PREFS_READABLE" = yes ] || die 'node is not registered; run join first'
-    [ "$OPENWRT_CURRENT_CONTROL_URL" = "$OPENWRT_EFFECTIVE_LOGIN_SERVER" ] || die 'current ControlURL differs from --login-server; refusing to advertise'
-
+openwrt_resolve_subnet() {
+    # Resolves --subnet (or the discovered LAN CIDR) into OPENWRT_SUBNET and
+    # runs the hard checks.  Shared by enable-subnet and enable-site-to-site.
     if [ -n "$OPENWRT_SUBNET" ]; then
         OPENWRT_SUBNET=$(net_normalize_cidr "$OPENWRT_SUBNET")
         net_is_ipv4_cidr "$OPENWRT_SUBNET" || die "--subnet must be an IPv4 CIDR: $OPENWRT_SUBNET"
@@ -674,23 +700,42 @@ openwrt_enable_subnet() {
         log_info "discovered LAN CIDR: $OPENWRT_SUBNET"
     fi
     openwrt_subnet_hard_checks "$OPENWRT_SUBNET"
+}
 
-    openwrt_es_new_routes=$OPENWRT_SUBNET
-    for openwrt_es_route in $OPENWRT_CURRENT_ADVERTISE_ROUTES; do
-        [ "$openwrt_es_route" = "$OPENWRT_SUBNET" ] && continue
-        openwrt_es_new_routes="$openwrt_es_route,$openwrt_es_new_routes"
+openwrt_converge_advertise_route() {
+    # Ensures OPENWRT_SUBNET is advertised while preserving other routes.
+    openwrt_car_new=$OPENWRT_SUBNET
+    for openwrt_car_route in $OPENWRT_CURRENT_ADVERTISE_ROUTES; do
+        [ "$openwrt_car_route" = "$OPENWRT_SUBNET" ] && continue
+        openwrt_car_new="$openwrt_car_route,$openwrt_car_new"
     done
     case " $OPENWRT_CURRENT_ADVERTISE_ROUTES " in
         *" $OPENWRT_SUBNET "*)
             log_info "$OPENWRT_SUBNET is already advertised; converging firewall only"
             ;;
         *)
-            tailscale set --advertise-routes="$openwrt_es_new_routes" || die 'tailscale set --advertise-routes failed'
-            log_change "advertised routes now: $openwrt_es_new_routes"
+            tailscale set --advertise-routes="$openwrt_car_new" || die 'tailscale set --advertise-routes failed'
+            log_change "advertised routes now: $openwrt_car_new"
             ;;
     esac
+}
 
+openwrt_enable_subnet() {
+    openwrt_require_root_real
+    openwrt_conflict_or_die
+    [ "$OPENWRT_PREFS_READABLE" = yes ] || die 'node is not registered; run join first'
+    [ "$OPENWRT_CURRENT_CONTROL_URL" = "$OPENWRT_EFFECTIVE_LOGIN_SERVER" ] || die 'current ControlURL differs from --login-server; refusing to advertise'
+
+    openwrt_resolve_subnet
+    openwrt_converge_advertise_route
+
+    # The zone is ensured BEFORE the forwarding so ts_to_lan can never
+    # reference a missing zone, and an existing ts_to_lan-without-zone
+    # breakage (observed in the field after external firewall edits) is
+    # repaired here instead of being left half-configured.
+    openwrt_firewall_ensure_zone
     openwrt_firewall_ensure_forwarding
+    [ "$OPENWRT_S2S_ENABLED" = yes ] && openwrt_firewall_ensure_lan_to_ts
     openwrt_firewall_commit_or_revert
 
     openwrt_refresh
@@ -745,8 +790,93 @@ openwrt_disable_subnet() {
     case " $OPENWRT_CURRENT_ADVERTISE_ROUTES " in
         *" $OPENWRT_SUBNET "*) die "route $OPENWRT_SUBNET still advertised after disable" ;;
     esac
+    if [ "$OPENWRT_S2S_ENABLED" = yes ]; then
+        log_warn 'site-to-site is still enabled: this router keeps accepting remote routes; run disable-site-to-site to turn that off too'
+    fi
     openwrt_write_state
     printf 'Subnet routing disabled for %s.\n' "$OPENWRT_SUBNET"
+}
+
+# --- site-to-site -------------------------------------------------------------
+#
+# Two explicit subnet modes, never switched silently:
+#   remote-access (default): advertise the LAN, accept-routes=false,
+#     tailscale -> lan only.  Remote Tailscale clients reach this LAN.
+#   site-to-site: additionally accept-routes=true and lan -> tailscale, so
+#     THIS LAN's clients also reach other tailnet nodes and the subnets other
+#     routers advertise.  Headscale approving a route is server-side only;
+#     every participating router still needs its own accept-routes=true.
+
+openwrt_enable_site_to_site() {
+    openwrt_require_root_real
+    openwrt_conflict_or_die
+    [ "$OPENWRT_PREFS_READABLE" = yes ] || die 'node is not registered; run join first'
+    [ "$OPENWRT_CURRENT_CONTROL_URL" = "$OPENWRT_EFFECTIVE_LOGIN_SERVER" ] || die 'current ControlURL differs from --login-server; refusing site-to-site'
+
+    openwrt_resolve_subnet
+    openwrt_converge_advertise_route
+
+    openwrt_refresh
+    if [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" != true ]; then
+        tailscale set --accept-routes=true || die 'tailscale set --accept-routes failed'
+        log_change 'accept-routes converged to true (site-to-site)'
+    fi
+
+    openwrt_firewall_ensure_zone
+    openwrt_firewall_ensure_forwarding
+    openwrt_firewall_ensure_lan_to_ts
+    openwrt_firewall_commit_or_revert
+
+    openwrt_refresh
+    [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ] || die 'accept-routes is not true after site-to-site setup'
+    case " $OPENWRT_CURRENT_ADVERTISE_ROUTES " in
+        *" $OPENWRT_SUBNET "*) : ;;
+        *) die "advertise verification failed; prefs routes: ${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}" ;;
+    esac
+    uci -q get firewall.ts_to_lan >/dev/null 2>&1 || die 'firewall.ts_to_lan missing after commit'
+    uci -q get firewall.lan_to_ts >/dev/null 2>&1 || die 'firewall.lan_to_ts missing after commit'
+
+    # The marker makes later apply/join/switch-to/update and the failover
+    # watchdog keep RouteAll=true instead of converging it back to false.
+    openwrt_ensure_bootstrap_config
+    openwrt_uci_ensure_section "$OPENWRT_UCI_TSBOOT.site_to_site" site_to_site || true
+    openwrt_uci_ensure_option "$OPENWRT_UCI_TSBOOT.site_to_site.enabled" 1 || true
+    uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+
+    openwrt_write_state
+    cat <<EOF
+Site-to-site enabled: $OPENWRT_SUBNET advertised, accept-routes=true, lan <-> tailscale forwarding active.
+Note: Headscale route approval is server-side only.  Every OTHER subnet router that should
+reach this LAN must also accept routes (accept-routes=true, or enable-site-to-site there);
+Headscale showing Approved/Serving does not imply peers accepted the route.
+EOF
+}
+
+openwrt_disable_site_to_site() {
+    openwrt_require_root_real
+    openwrt_conflict_or_die
+
+    if [ "$OPENWRT_PREFS_READABLE" = yes ] && [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ]; then
+        tailscale set --accept-routes=false || die 'tailscale set --accept-routes failed'
+        log_change 'accept-routes converged to false (site-to-site disabled)'
+    fi
+
+    openwrt_uci_delete_if_exists firewall.lan_to_ts
+    openwrt_firewall_commit_or_revert
+
+    if uci -q get "$OPENWRT_UCI_TSBOOT.site_to_site" >/dev/null 2>&1; then
+        openwrt_uci_ensure_option "$OPENWRT_UCI_TSBOOT.site_to_site.enabled" 0 || true
+        uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
+    fi
+
+    openwrt_refresh
+    uci -q get firewall.lan_to_ts >/dev/null 2>&1 && die 'firewall.lan_to_ts still present after disable'
+    if [ "$OPENWRT_PREFS_READABLE" = yes ] && [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ]; then
+        die 'accept-routes is still true after disable'
+    fi
+    openwrt_write_state
+    printf 'Site-to-site disabled: accept-routes=false, lan -> tailscale forwarding removed.\n'
+    printf 'Subnet advertisement (tailscale -> lan) is unchanged; manage it with enable-subnet/disable-subnet.\n'
 }
 
 openwrt_allow_wan_udp() {
@@ -851,6 +981,23 @@ $(awk '
 ' "$OPENWRT_CONFIG_BOOTSTRAP" | sort -t'|' -k3,3n -k1,1)
 EOF
     OPENWRT_PROFILE_URLS=$(printf '%s\n' "$OPENWRT_PROFILE_URLS" | awk '{$1=$1; print}')
+    return 0
+}
+
+openwrt_load_site_to_site() {
+    # Reads the committed marker written by enable-site-to-site:
+    #   config site_to_site 'site_to_site' + option enabled '1'.
+    # The marker drives mode-aware prefs convergence (converge_prefs, the
+    # failover watchdog) and the site-to-site verify checks, so accept-routes
+    # is never silently reset to the safe default while the mode is on.
+    OPENWRT_S2S_ENABLED=no
+    [ -r "$OPENWRT_CONFIG_BOOTSTRAP" ] || return 0
+    openwrt_s2s_value=$(awk '
+        function unq(s) { gsub(/^[\047"]|[\047"]$/, "", s); return s }
+        $1 == "config" { insec = (unq($2) == "site_to_site") }
+        insec && $1 == "option" && unq($2) == "enabled" { print unq($3); exit }
+    ' "$OPENWRT_CONFIG_BOOTSTRAP" 2>/dev/null)
+    [ "$openwrt_s2s_value" = 1 ] && OPENWRT_S2S_ENABLED=yes
     return 0
 }
 
@@ -1524,6 +1671,16 @@ openwrt_update() {
     openwrt_ensure_core
     openwrt_init_action tailscale-core restart || die 'failed to restart tailscale-core (only tailscale-core is restarted)'
 
+    # A package upgrade or external tooling can drop managed firewall
+    # sections (e.g. a conffile refresh removing the zone while ts_to_lan
+    # survives): reconcile here instead of dying on the broken state.
+    openwrt_firewall_ensure_zone
+    if [ "$OPENWRT_S2S_ENABLED" = yes ]; then
+        openwrt_firewall_ensure_forwarding
+        openwrt_firewall_ensure_lan_to_ts
+    fi
+    openwrt_firewall_commit_or_revert
+
     openwrt_refresh
     [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_update_control" ] || \
         die "ControlURL changed after update: $openwrt_update_control -> $OPENWRT_CURRENT_CONTROL_URL"
@@ -1640,6 +1797,7 @@ openwrt_cleanup() {
 
     openwrt_c_changed=0
     openwrt_uci_delete_if_exists firewall.ts_to_lan && openwrt_c_changed=1
+    openwrt_uci_delete_if_exists firewall.lan_to_ts && openwrt_c_changed=1
     openwrt_uci_delete_if_exists firewall.tailscale && openwrt_c_changed=1
     openwrt_uci_delete_if_exists firewall.ts_wan_udp && openwrt_c_changed=1
     openwrt_firewall_commit_or_revert

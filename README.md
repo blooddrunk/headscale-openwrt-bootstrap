@@ -95,8 +95,14 @@ cd /root/headscale-openwrt-bootstrap
 ./tailscale-openwrt.sh --login-server https://hs.example.com \
     --auth-key-stdin join
 
-# 4. （可选）把 LAN 网段作为 subnet router 广播出去
+# 4. （可选）把 LAN 网段作为 subnet router 广播出去（remote-access 模式：
+#    远程 Tailscale 客户端可以访问本站 LAN，本站 LAN 不访问他人）
 ./tailscale-openwrt.sh --login-server https://hs.example.com enable-subnet
+
+# 5. （可选）升级为 site-to-site：本站 LAN 客户端也能访问其他 tailnet
+#    节点和别的站点广播的网段（accept-routes=true + lan->tailscale）
+./tailscale-openwrt.sh --login-server https://hs.example.com enable-site-to-site
+./tailscale-openwrt.sh --login-server https://hs.example.com disable-site-to-site
 ```
 
 `--auth-key-file` 和 `--auth-key-stdin` 互斥。`--auth-key-stdin` 不会把
@@ -121,6 +127,48 @@ printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
 # 在 VPS 上执行
 sudo ./headscale-vps.sh approve-route --node-id <ID> --route 192.168.10.0/24
 ```
+
+### subnet 两种模式：remote-access 与 site-to-site
+
+`enable-subnet`（默认）与 `enable-site-to-site` 是两个显式的档位，脚本
+不会偷偷改安全默认值：
+
+```text
+remote-access（enable-subnet）:
+  accept-routes=false, tailscale -> lan
+  仅远程 Tailscale 客户端访问本站 LAN
+
+site-to-site（enable-site-to-site）:
+  accept-routes=true, tailscale -> lan + lan -> tailscale
+  本站 LAN 客户端还可以访问其他 tailnet 节点和其他站点广播的网段
+```
+
+`disable-site-to-site` 只退回 remote-access（撤掉 `lan -> tailscale`、
+accept-routes=false），subnet 广播本身仍由 `enable-subnet`/
+`disable-subnet` 单独管理。启用状态记录在
+`/etc/config/tailscale-bootstrap`（`config site_to_site`）；此后的
+`apply`/`join`/`switch-to`/`update` 以及 failover watchdog 切换都会按
+该标记收敛 accept-routes，不会把它静默重置回 false。
+
+两个现场教训已固化成代码与检查：
+
+- **forwarding 永远不引用缺失的 zone**：`enable-subnet`/`apply`/`join`/
+  `update`/`enable-site-to-site` 都先确保 `firewall.tailscale` zone
+  存在再收敛 forwarding；`ts_to_lan` 存在但 zone 缺失会被 `status`/
+  `verify` 判定为 `ts_to_lan-references-missing-zone`（BROKEN），并在
+  下一次 mutating 命令中自动修复，而不是带病运行。
+- **Headscale 批准 ≠ 对端接受路由**：Headscale 里 `Approved/Serving`
+  只是服务端愿意分发该网段；每个参与站点自己的 `accept-routes` 必须
+  为 true（即对端也执行 `enable-site-to-site`），否则回程不通。
+  `status` 在有广告路由时会输出该提示，site-to-site 模式下还会校验
+  `RouteAll` 与两条 forwarding 的一致性。
+
+仍然不做的事：不给 tailscale zone 开 masquerade（Tailscale 自带 subnet
+SNAT）、不创建 `network.tailscale`、不 reload network、不
+`tailscale up --reset`；所有防火墙修改依旧走
+`fw4 check -> commit -> firewall reload` 事务，managed section 全部使用
+固定名字（`tailscale` / `ts_to_lan` / `lan_to_ts` / `ts_wan_udp`），
+`cleanup` 也只删这四个。
 
 ## 多 profile 与故障切换（OpenWrt 端）
 
@@ -194,7 +242,8 @@ watchdog（`/usr/sbin/tailscale-failover`，procd 守护 `tailscale-failover`）
   失败达 3 次的候选会被暂停（成功一次即归零）；
 - `--failback true` 才会回切更高优先级网络，默认保持稳定；
 - `cooldown` 秒内不发生第二次切换，切换后立即收敛安全偏好
-  （accept-dns=false / accept-routes=false）；
+  （accept-dns=false；accept-routes 按 `site_to_site` 标记收敛——
+  site-to-site 模式保持 true，否则 false，切换不会静默改变模式）；
 - 手动切到列表之外的网络时，只要它健康 watchdog 就不干预；失效才接管；
 - 运行状态（探测计数、最近切换时间、每次决策结果）在
   `/var/run/tailscale-failover`（tmpfs，重启清零，短阈值下无妨）；
@@ -232,7 +281,8 @@ subnet router 需在新服务器重新批准。
 | `profile-list` / `profile-add` / `profile-remove` | OpenWrt | 多网络登记表（增/删/查，`--priority` 数字越小越优先，`--delete-identity` 同时注销身份）  |
 | `switch-to`                                       | OpenWrt | 手动切换到列表中的某个网络（经 ControlURL 校验）                                            |
 | `enable-failover` / `disable-failover`            | OpenWrt | 安装/启动/停止按优先级与健康探测自动切换的 watchdog（需 ≥2 个 profile，启用前实测各网络 /health） |
-| `enable-subnet` / `disable-subnet`                | OpenWrt | 广播/撤回 LAN 网段，附 fw4 forwarding 事务                                                  |
+| `enable-subnet` / `disable-subnet`                | OpenWrt | 广播/撤回 LAN 网段（remote-access 模式），附 fw4 forwarding 事务                        |
+| `enable-site-to-site` / `disable-site-to-site`    | OpenWrt | 显式切换 site-to-site（accept-routes=true + lan->tailscale）/退回 remote-access          |
 | `allow-wan-udp [false]`                           | OpenWrt | 添加/移除最窄的 WAN UDP 41641 入站规则                                                      |
 | `update`                                          | 双端    | 升级（VPS 遵守 minor 顺序；OpenWrt 只重启 tailscale-core 并校验身份不变）                   |
 | `rollback [BACKUP_ID]`                            | 双端    | 把配置+数据+（VPS）软件包、（OpenWrt）profile 登记表与 watchdog 作为一个快照整体恢复        |

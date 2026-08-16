@@ -386,7 +386,7 @@ assert_contains "$OUT" 'failover-watchdog-missing-or-unverified'
 
 log_reset
 run_ow --login-server "$A" enable-failover >/dev/null
-assert_file_contains "$ROOT/usr/sbin/tailscale-failover" 'TS_FAILOVER_WATCHDOG_v2'
+assert_file_contains "$ROOT/usr/sbin/tailscale-failover" 'TS_FAILOVER_WATCHDOG_v3'
 TAMPERED_BACKUP=$(grep -rl '# tampered by hand' "$ROOT"/root/tailscale-bootstrap-backups/*/source/usr/sbin/tailscale-failover 2>/dev/null | sed -n '1p')
 [ -n "$TAMPERED_BACKUP" ] || fail 'tampered watchdog must be backed up before repair'
 run_ow --login-server "$A" status >/dev/null

@@ -102,7 +102,15 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
   disable-failover         Stop + disable the watchdog; profiles are kept.
   enable-subnet            Advertise --subnet (or the discovered LAN CIDR) and
                            add IPv4 tailscale->lan forwarding after fw4 check.
+                           Remote-access mode (default): accept-routes stays
+                           false and lan->tailscale stays absent.
   disable-subnet           Withdraw --subnet and remove the forwarding.
+  enable-site-to-site      Explicitly switch the subnet role to site-to-site:
+                           advertise the LAN, accept-routes=true, plus the
+                           lan->tailscale forwarding.  LAN clients can then
+                           reach other tailnet nodes and remote subnets.
+  disable-site-to-site     Back to remote-access: accept-routes=false, remove
+                           lan->tailscale; advertisement is kept as-is.
   allow-wan-udp [false]    Add/remove the narrow WAN UDP input rule.
   update                   Upgrade the tailscale package; restarts
                            tailscale-core only and verifies identity kept.
@@ -235,7 +243,7 @@ openwrt_validate_options() {
 openwrt_parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            discover|plan|status|verify|backup|install|apply|join|profile-list|profile-add|profile-remove|switch-to|enable-failover|disable-failover|update|enable-subnet|disable-subnet|allow-wan-udp|rollback|cleanup|purge-identity)
+            discover|plan|status|verify|backup|install|apply|join|profile-list|profile-add|profile-remove|switch-to|enable-failover|disable-failover|update|enable-subnet|disable-subnet|enable-site-to-site|disable-site-to-site|allow-wan-udp|rollback|cleanup|purge-identity)
                 [ -z "$OPENWRT_COMMAND" ] || die "multiple commands supplied: $OPENWRT_COMMAND and $1"
                 OPENWRT_COMMAND=$1
                 shift
@@ -511,7 +519,7 @@ openwrt_watchdog_fingerprint() {
         printf 'absent\n'
         return 0
     fi
-    if grep -qF 'TS_FAILOVER_WATCHDOG_v2' "$openwrt_wd_file" 2>/dev/null \
+    if grep -qF 'TS_FAILOVER_WATCHDOG_v3' "$openwrt_wd_file" 2>/dev/null \
         && grep -qF 'failover_probe' "$openwrt_wd_file" 2>/dev/null \
         && grep -qF 'tailscale switch' "$openwrt_wd_file" 2>/dev/null \
         && ! grep -qF 'tailscale up' "$openwrt_wd_file" 2>/dev/null \
@@ -726,6 +734,7 @@ openwrt_collect_facts() {
     fi
 
     openwrt_load_profiles
+    openwrt_load_site_to_site
 
     OPENWRT_CONFIG_LOGIN_SERVER=
     if [ "$OPENWRT_TAILSCALE_CONFIG_PRESENT" = yes ]; then
@@ -748,16 +757,19 @@ openwrt_collect_facts() {
     OPENWRT_NETWORK_TS_PRESENT=no
     OPENWRT_FIREWALL_TS_PRESENT=no
     OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=no
+    OPENWRT_FIREWALL_LAN_TO_TS_PRESENT=no
     OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=no
     if bootstrap_command_exists uci; then
         uci -q get network.tailscale >/dev/null 2>&1 && OPENWRT_NETWORK_TS_PRESENT=yes
         uci -q get firewall.tailscale >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_PRESENT=yes
         uci -q get firewall.ts_to_lan >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=yes
+        uci -q get firewall.lan_to_ts >/dev/null 2>&1 && OPENWRT_FIREWALL_LAN_TO_TS_PRESENT=yes
         uci -q get firewall.ts_wan_udp >/dev/null 2>&1 && OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=yes
     else
         openwrt_section_in_file "$OPENWRT_CONFIG_NETWORK" interface tailscale && OPENWRT_NETWORK_TS_PRESENT=yes
         openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" zone tailscale && OPENWRT_FIREWALL_TS_PRESENT=yes
         openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" forwarding ts_to_lan && OPENWRT_FIREWALL_TS_TO_LAN_PRESENT=yes
+        openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" forwarding lan_to_ts && OPENWRT_FIREWALL_LAN_TO_TS_PRESENT=yes
         openwrt_section_in_file "$OPENWRT_CONFIG_FIREWALL" rule ts_wan_udp && OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT=yes
     fi
 
@@ -795,6 +807,15 @@ openwrt_collect_facts() {
 openwrt_effective_values() {
     OPENWRT_EFFECTIVE_LOGIN_SERVER=${OPENWRT_LOGIN_SERVER:-$OPENWRT_CURRENT_CONTROL_URL}
     OPENWRT_EFFECTIVE_LOGIN_SERVER=$(bootstrap_normalize_url "$OPENWRT_EFFECTIVE_LOGIN_SERVER")
+    # Mode-aware accept-routes target: while site-to-site is enabled, the
+    # marker (not the CLI default) wins so idempotent convergence on
+    # apply/join/switch-to keeps RouteAll=true; disable-site-to-site is the
+    # explicit way back to false.
+    if [ "${OPENWRT_S2S_ENABLED:-no}" = yes ]; then
+        OPENWRT_EFFECTIVE_ACCEPT_ROUTES=true
+    else
+        OPENWRT_EFFECTIVE_ACCEPT_ROUTES=$OPENWRT_ACCEPT_ROUTES
+    fi
     if [ "$OPENWRT_SERVICE_MODE" = auto ]; then
         OPENWRT_EFFECTIVE_SERVICE_MODE=core
     else
@@ -817,14 +838,17 @@ openwrt_print_text_discover() {
     printf '  current ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
     printf '  backend state/IP4: %s/%s\n' "$OPENWRT_TAILSCALE_STATE" "$OPENWRT_TAILSCALE_IP4"
     printf '  prefs readable/profiles: %s/%s\n' "$OPENWRT_PREFS_READABLE" "$OPENWRT_PROFILE_STATE"
+    printf '  accept-dns/accept-routes(RouteAll): %s/%s\n' "$OPENWRT_CURRENT_ACCEPT_DNS" "$OPENWRT_CURRENT_ACCEPT_ROUTES"
     printf '  advertise routes: %s\n' "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+    printf '  site-to-site enabled: %s\n' "${OPENWRT_S2S_ENABLED:-no}"
     printf '  exit-node risk: %s\n' "$OPENWRT_EXIT_NODE_RISK"
     printf '  tailscale0 present/IP4: %s/%s\n' "$OPENWRT_TS0_PRESENT" "$OPENWRT_TS0_IP4"
     printf '  fw4 device tailscale0: %s\n' "$OPENWRT_FIREWALL_DEVICE"
     printf '  LAN route observed: %s\n' "$OPENWRT_LAN_ROUTE"
     printf '  UCI network/firewall pending: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
-    printf '  UCI sections network.tailscale/firewall.tailscale/ts_to_lan/ts_wan_udp: %s/%s/%s/%s\n' \
-        "$OPENWRT_NETWORK_TS_PRESENT" "$OPENWRT_FIREWALL_TS_PRESENT" "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
+    printf '  UCI sections network.tailscale/firewall.tailscale/ts_to_lan/lan_to_ts/ts_wan_udp: %s/%s/%s/%s/%s\n' \
+        "$OPENWRT_NETWORK_TS_PRESENT" "$OPENWRT_FIREWALL_TS_PRESENT" "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" \
+        "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT" "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
     printf '  UDP %s: %s\n' "$OPENWRT_TS_PORT" "$OPENWRT_UDP_TS_PORT"
     printf '  bootstrap profiles: %s (%s)\n' "$OPENWRT_PROFILE_COUNT" "${OPENWRT_PROFILE_URLS:-none}"
     printf '  failover enabled/service/fingerprint: %s/%s/%s\n' \
@@ -861,7 +885,10 @@ openwrt_print_json_discover() {
     bootstrap_json_field tailscale_ip4 "$OPENWRT_TAILSCALE_IP4"
     bootstrap_json_field prefs_readable "$OPENWRT_PREFS_READABLE"
     bootstrap_json_field profiles "$OPENWRT_PROFILE_STATE"
+    bootstrap_json_field accept_dns "$OPENWRT_CURRENT_ACCEPT_DNS"
+    bootstrap_json_field accept_routes "$OPENWRT_CURRENT_ACCEPT_ROUTES"
     bootstrap_json_field advertise_routes "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+    bootstrap_json_field site_to_site "${OPENWRT_S2S_ENABLED:-no}"
     bootstrap_json_field exit_node_risk "$OPENWRT_EXIT_NODE_RISK"
     bootstrap_json_field tailscale0 "$OPENWRT_TS0_PRESENT"
     bootstrap_json_field tailscale0_ip4 "$OPENWRT_TS0_IP4"
@@ -872,6 +899,7 @@ openwrt_print_json_discover() {
     bootstrap_json_field network_tailscale "$OPENWRT_NETWORK_TS_PRESENT"
     bootstrap_json_field firewall_tailscale "$OPENWRT_FIREWALL_TS_PRESENT"
     bootstrap_json_field firewall_ts_to_lan "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT"
+    bootstrap_json_field firewall_lan_to_ts "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT"
     bootstrap_json_field firewall_ts_wan_udp "$OPENWRT_FIREWALL_TS_WAN_UDP_PRESENT"
     bootstrap_json_field udp_port_state "$OPENWRT_UDP_TS_PORT"
     bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
@@ -1002,6 +1030,7 @@ openwrt_plan() {
         printf '  pending network/firewall UCI: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
         printf '  exit-node risk: %s; subnet requested: %s/%s; WAN UDP requested: %s\n' \
             "$OPENWRT_EXIT_NODE_RISK" "$OPENWRT_ENABLE_SUBNET" "${OPENWRT_SUBNET:-none}" "$OPENWRT_ALLOW_WAN_UDP"
+        printf '  site-to-site currently enabled: %s\n' "${OPENWRT_S2S_ENABLED:-no}"
         printf '\nplan itself changes nothing; install/apply/join would:\n'
         if [ "$OPENWRT_TAILSCALE_PACKAGE" = absent ]; then
             printf '  - install only the Tailscale package required by the selected package manager\n'
@@ -1081,9 +1110,43 @@ openwrt_status() {
         OPENWRT_STATUS_CODE=2
         OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS tailscale0-not-bound-to-fw4-zone"
     fi
-    if [ "$OPENWRT_CURRENT_ACCEPT_DNS" = true ] || [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ]; then
+    if [ "$OPENWRT_CURRENT_ACCEPT_DNS" = true ]; then
         OPENWRT_STATUS_CODE=2
-        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS unsafe-dns-or-route-acceptance"
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS unsafe-accept-dns"
+    fi
+    if [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" = true ] && [ "${OPENWRT_S2S_ENABLED:-no}" != yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS accept-routes-without-site-to-site"
+    fi
+    # A forwarding that references the missing tailscale zone is a broken
+    # config (fw4 rejects the src/dest), not a healthy subnet router.
+    if [ "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" = yes ] && [ "$OPENWRT_FIREWALL_TS_PRESENT" != yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS ts_to_lan-references-missing-zone"
+    fi
+    if [ "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT" = yes ] && [ "$OPENWRT_FIREWALL_TS_PRESENT" != yes ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS lan_to_ts-references-missing-zone"
+    fi
+    # Subnet router expectation: the forwarding belongs to an advertised
+    # route; ts_to_lan without any advertisement is a stale half-config.
+    if [ "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" = yes ] && [ -z "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-}" ]; then
+        OPENWRT_STATUS_CODE=2
+        OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS ts_to_lan-without-advertised-routes"
+    fi
+    if [ "${OPENWRT_S2S_ENABLED:-no}" = yes ]; then
+        if [ "$OPENWRT_CURRENT_ACCEPT_ROUTES" != true ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS site-to-site-accept-routes-off"
+        fi
+        if [ "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" != yes ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS site-to-site-ts-to-lan-missing"
+        fi
+        if [ "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT" != yes ]; then
+            OPENWRT_STATUS_CODE=2
+            OPENWRT_STATUS_REASONS="$OPENWRT_STATUS_REASONS site-to-site-lan-to-ts-missing"
+        fi
     fi
     if [ "$OPENWRT_UNSAFE_LUCI_HELPER" = yes ] && [ "$OPENWRT_STOCK_SERVICE_ENABLED" = yes ]; then
         OPENWRT_STATUS_CODE=2
@@ -1129,6 +1192,12 @@ openwrt_status() {
         bootstrap_json_field tailscale_ip4 "$OPENWRT_TAILSCALE_IP4"
         bootstrap_json_field tailscale0 "$OPENWRT_TS0_PRESENT"
         bootstrap_json_field fw4_device "$OPENWRT_FIREWALL_DEVICE"
+        bootstrap_json_field accept_dns "$OPENWRT_CURRENT_ACCEPT_DNS"
+        bootstrap_json_field accept_routes "$OPENWRT_CURRENT_ACCEPT_ROUTES"
+        bootstrap_json_field advertise_routes "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+        bootstrap_json_field site_to_site "${OPENWRT_S2S_ENABLED:-no}"
+        bootstrap_json_field firewall_ts_to_lan "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT"
+        bootstrap_json_field firewall_lan_to_ts "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT"
         bootstrap_json_field core_service "$OPENWRT_INIT_CORE_PRESENT"
         bootstrap_json_field network_changes "$OPENWRT_CURRENT_NETWORK_CHANGES"
         bootstrap_json_field firewall_changes "$OPENWRT_CURRENT_FIREWALL_CHANGES"
@@ -1145,12 +1214,20 @@ openwrt_status() {
         printf '  ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
         printf '  Tailscale IPv4/tailscale0: %s/%s\n' "$OPENWRT_TAILSCALE_IP4" "$OPENWRT_TS0_PRESENT"
         printf '  fw4 device tailscale0: %s\n' "$OPENWRT_FIREWALL_DEVICE"
+        printf '  accept-dns/accept-routes(RouteAll): %s/%s\n' "$OPENWRT_CURRENT_ACCEPT_DNS" "$OPENWRT_CURRENT_ACCEPT_ROUTES"
+        printf '  advertised routes: %s\n' "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-none}"
+        printf '  site-to-site: %s; forwarding ts_to_lan/lan_to_ts: %s/%s\n' \
+            "${OPENWRT_S2S_ENABLED:-no}" "$OPENWRT_FIREWALL_TS_TO_LAN_PRESENT" "$OPENWRT_FIREWALL_LAN_TO_TS_PRESENT"
         printf '  tailscale-core present: %s\n' "$OPENWRT_INIT_CORE_PRESENT"
         printf '  stock init enabled: %s; unsafe helper: %s\n' "$OPENWRT_STOCK_SERVICE_ENABLED" "$OPENWRT_UNSAFE_LUCI_HELPER"
         printf '  network/firewall UCI pending: %s/%s\n' "$OPENWRT_CURRENT_NETWORK_CHANGES" "$OPENWRT_CURRENT_FIREWALL_CHANGES"
         printf '  exit-node risk: %s\n' "$OPENWRT_EXIT_NODE_RISK"
         printf '  bootstrap profiles: %s (%s); failover: %s (service %s)\n' \
             "$OPENWRT_PROFILE_COUNT" "${OPENWRT_PROFILE_URLS:-none}" "$OPENWRT_FAILOVER_ENABLED" "$OPENWRT_INIT_FAILOVER_PRESENT"
+        if [ -n "${OPENWRT_CURRENT_ADVERTISE_ROUTES:-}" ]; then
+            printf '  note: Headscale approval (Approved/Serving) is server-side; each peer only routes\n'
+            printf '        remote subnets when ITS OWN accept-routes is true (enable-site-to-site there).\n'
+        fi
         if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then printf 'OK\n'; else printf 'FAIL: %s\n' "${OPENWRT_STATUS_REASONS# }"; fi
     fi
 
@@ -1224,6 +1301,8 @@ openwrt_main() {
         disable-failover) openwrt_disable_failover ;;
         enable-subnet) openwrt_enable_subnet ;;
         disable-subnet) openwrt_disable_subnet ;;
+        enable-site-to-site) openwrt_enable_site_to_site ;;
+        disable-site-to-site) openwrt_disable_site_to_site ;;
         allow-wan-udp) openwrt_allow_wan_udp ;;
         update) openwrt_update ;;
         rollback) openwrt_rollback ;;

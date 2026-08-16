@@ -11,6 +11,7 @@ touches a real VPS or router, and no target init script is ever executed
 | `test-vps-install.sh` | VPS .deb install/render/configtest/health, idempotent apply, caddy mode, 1Panel patch with failed `-t` restore |
 | `test-openwrt-core.sh` | package + tailscale-core, disable-only for the unsafe stock service, fw4 zone transaction ordering, join (file: key, no `--reset`, multi-Headscale stop) |
 | `test-openwrt-subnet.sh` | LAN CIDR discovery math, overlap hard checks, forwarding transaction, disable path, WAN UDP rule on/off |
+| `test-openwrt-s2s.sh` | remote-access vs site-to-site modes, lan->tailscale forwarding, ts_to_lan-without-zone BROKEN detection + auto-repair, accept-routes kept across apply/watchdog switches in site-to-site mode |
 | `test-update-rollback.sh` | users/keys/route approval, minor-sequential updates, one-snapshot rollback, cleanup/purge on both sides |
 | `test-failure-injection.sh` | DNS/port/configtest/deb/opkg/auth failures, apply x3 idempotency, reboot steady state |
 | `test-openwrt-failover.sh` | profile-add (login/adopt/switch-back), profile-remove (--delete-identity), switch-to, enable/disable-failover, watchdog cycles (failover, cooldown, failback, both-down, drifted current), tamper repair, rollback/cleanup of failover state |
