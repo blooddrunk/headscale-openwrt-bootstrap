@@ -1058,6 +1058,7 @@ openwrt_plan() {
         printf '  - failover only switches profiles registered via profile-add; it never logs in\n'
         if [ "$openwrt_plan_blocked" -eq 1 ]; then
             printf '\nBLOCKED: %s\n' "${openwrt_block_reasons# }"
+            bootstrap_explain_reasons "$openwrt_block_reasons"
         else
             printf '\nREADY: no hard conflict found; install/apply/join may proceed.\n'
         fi
@@ -1228,7 +1229,7 @@ openwrt_status() {
             printf '  note: Headscale approval (Approved/Serving) is server-side; each peer only routes\n'
             printf '        remote subnets when ITS OWN accept-routes is true (enable-site-to-site there).\n'
         fi
-        if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then printf 'OK\n'; else printf 'FAIL: %s\n' "${OPENWRT_STATUS_REASONS# }"; fi
+        if [ "$OPENWRT_STATUS_CODE" -eq 0 ]; then printf 'OK\n'; else printf 'FAIL: %s\n' "${OPENWRT_STATUS_REASONS# }"; bootstrap_explain_reasons "$OPENWRT_STATUS_REASONS"; fi
     fi
 
     return "$OPENWRT_STATUS_CODE"

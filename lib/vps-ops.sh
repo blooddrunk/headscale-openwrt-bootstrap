@@ -35,6 +35,7 @@ vps_conflict_or_die() {
     vps_compute_conflicts mutate
     if [ "$vps_plan_blocked" -eq 1 ]; then
         log_error "blocked preconditions: ${vps_block_reasons# }"
+        bootstrap_explain_reasons "$vps_block_reasons" >&2
         exit 2
     fi
 }

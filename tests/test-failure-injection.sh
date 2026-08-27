@@ -94,6 +94,7 @@ OUT=$(expect_fail 2 env FAKE_SS_EMPTY=1 FAKE_GETENT_IP=198.51.100.99 FAKE_VPS_RO
     FAKE_LOG="$VLOG" PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VROOT" \
     --domain hs.example.com --expected-public-ip 203.0.113.10 install)
 assert_contains "$OUT" 'dns-not-confirmed-or-proxied'
+assert_contains "$OUT" 'create/fix the A record'
 
 # 2. Unknown process on 443 -> fail closed, no takeover.
 make_vps_root vps-fi2
@@ -101,6 +102,7 @@ OUT=$(expect_fail 2 env FAKE_NO_DOCKER=1 FAKE_SS_UNKNOWN_443=1 FAKE_VPS_ROOT="$V
     FAKE_LOG="$VLOG" PATH="$VPS_BIN:$PATH" "$VPS_SCRIPT" --root "$VROOT" \
     --domain hs.example.com --expected-public-ip 203.0.113.10 plan)
 assert_contains "$OUT" 'unknown-service-on-443'
+assert_contains "$OUT" 'identify it (ss -tlnp)'
 
 # 3. Deb metadata mismatch -> abort before apt installs anything.
 make_vps_root vps-fi3
@@ -163,6 +165,7 @@ if [ "$OW_SKIP" = 0 ]; then
     rm -f "$OROOT/dev/net/tun"
     OUT=$(expect_fail 2 ow install)
     assert_contains "$OUT" 'tun-missing'
+assert_contains "$OUT" 'opkg install kmod-tun'
 
     # 8. Client too old for the server's minimum -> stop (PLAN 17).
     make_ow_root ow-fi8

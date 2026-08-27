@@ -30,6 +30,7 @@ openwrt_conflict_or_die() {
     openwrt_compute_conflicts mutate
     if [ "$openwrt_plan_blocked" -eq 1 ]; then
         log_error "blocked preconditions: ${openwrt_block_reasons# }"
+        bootstrap_explain_reasons "$openwrt_block_reasons" >&2
         exit 2
     fi
 }
@@ -581,6 +582,7 @@ EOF
     openwrt_compute_conflicts mutate
     if [ "$openwrt_plan_blocked" -eq 1 ]; then
         log_error "blocked preconditions: ${openwrt_block_reasons# }"
+        bootstrap_explain_reasons "$openwrt_block_reasons" >&2
         exit 2
     fi
 
@@ -1170,6 +1172,7 @@ openwrt_profile_guard() {
     openwrt_effective_values
     if [ "$openwrt_plan_blocked" -eq 1 ]; then
         log_error "blocked preconditions: ${openwrt_block_reasons# }"
+        bootstrap_explain_reasons "$openwrt_block_reasons" >&2
         exit 2
     fi
 }

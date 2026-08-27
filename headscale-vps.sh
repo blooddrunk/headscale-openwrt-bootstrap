@@ -884,6 +884,7 @@ vps_plan() {
         printf '  - no public bind for 8080/9090/50443; no unconditional 3478/udp opening\n'
         if [ "$vps_plan_blocked" -eq 1 ]; then
             printf '\nBLOCKED: %s\n' "${vps_block_reasons# }"
+            bootstrap_explain_reasons "$vps_block_reasons"
         else
             printf '\nREADY: no hard conflict found; install/apply may proceed.\n'
         fi
@@ -985,6 +986,7 @@ vps_status() {
             printf 'OK\n'
         else
             printf 'FAIL: %s\n' "${VPS_STATUS_REASONS# }"
+            bootstrap_explain_reasons "$VPS_STATUS_REASONS"
         fi
     fi
 
