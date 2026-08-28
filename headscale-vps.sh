@@ -30,6 +30,9 @@ VPS_LISTEN=127.0.0.1:8080
 VPS_METRICS_LISTEN=127.0.0.1:9090
 VPS_GRPC_LISTEN=127.0.0.1:50443
 VPS_ENABLE_DERP=false
+VPS_ENABLE_DERP_EXPLICIT=0
+VPS_DERP_REGION_CODE_FLAG=
+VPS_DERP_REGION_NAME_FLAG=
 VPS_EXPECTED_PUBLIC_IP=
 VPS_KEY_EXPIRATION=2h
 VPS_KEY_OUTPUT=
@@ -65,6 +68,11 @@ Mutating commands (each backs up before writing, validates, then verifies):
   issue-key                Issue a one-shot pre-auth key (--user, --expiration,
                            optional --output FILE mode 0600).
   approve-route            Approve --route for --node-id on the Headscale side.
+  enable-derp              Enable the embedded DERP relay + STUN: region keys
+                           and derp.server.ipv4 become managed, verified after
+                           restart (UDP STUN listener + /derp/probe).
+  disable-derp             Turn the embedded DERP relay off; region keys and
+                           derp.urls stay in place for a later re-enable.
   update                   Upgrade Headscale (stable minors are never skipped).
   rollback [BACKUP_ID]     Restore config+data+package as one snapshot.
   cleanup                  Stop/disable Headscale, remove only script-owned
@@ -79,7 +87,11 @@ Options:
   --listen ADDRESS:PORT
   --metrics-listen ADDRESS:PORT
   --grpc-listen ADDRESS:PORT
-  --enable-embedded-derp true|false   (true is refused in this build)
+  --enable-embedded-derp true|false   Explicit override for install/apply/update;
+                           default keeps the config's current DERP state.
+  --derp-region-code CODE   Embedded DERP region code (default: first domain
+                           label with a leading "hs-" stripped).
+  --derp-region-name NAME   Embedded DERP region name (default: "<Code> VPS").
   --expected-public-ip IP   Optional DNS-to-VPS comparison input.
   --expiration DURATION     issue-key lifetime (default 2h)
   --output FILE             issue-key destination (mode 0600)
@@ -133,7 +145,7 @@ vps_need_value() {
 vps_parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            discover|plan|status|verify|backup|install|apply|update|rollback|cleanup|purge|ensure-user|issue-key|approve-route)
+            discover|plan|status|verify|backup|install|apply|update|rollback|cleanup|purge|ensure-user|issue-key|approve-route|enable-derp|disable-derp)
                 [ -z "$VPS_COMMAND" ] || die "multiple commands supplied: $VPS_COMMAND and $1"
                 VPS_COMMAND=$1
                 shift
@@ -183,9 +195,22 @@ vps_parse_args() {
             --enable-embedded-derp)
                 vps_need_value "$@"
                 VPS_ENABLE_DERP=$(vps_parse_bool "$2")
+                VPS_ENABLE_DERP_EXPLICIT=1
                 shift 2
                 ;;
-            --enable-embedded-derp=*) VPS_ENABLE_DERP=$(vps_parse_bool "${1#*=}"); shift ;;
+            --enable-embedded-derp=*) VPS_ENABLE_DERP=$(vps_parse_bool "${1#*=}"); VPS_ENABLE_DERP_EXPLICIT=1; shift ;;
+            --derp-region-code)
+                vps_need_value "$@"
+                VPS_DERP_REGION_CODE_FLAG=$2
+                shift 2
+                ;;
+            --derp-region-code=*) VPS_DERP_REGION_CODE_FLAG=${1#*=}; shift ;;
+            --derp-region-name)
+                vps_need_value "$@"
+                VPS_DERP_REGION_NAME_FLAG=$2
+                shift 2
+                ;;
+            --derp-region-name=*) VPS_DERP_REGION_NAME_FLAG=${1#*=}; shift ;;
             --expected-public-ip)
                 vps_need_value "$@"
                 VPS_EXPECTED_PUBLIC_IP=$2
@@ -485,6 +510,8 @@ vps_collect_facts() {
     VPS_CURRENT_TLS_KEY=
     VPS_CURRENT_TRUSTED_PROXIES=
     VPS_CURRENT_DERP_ENABLED=
+    VPS_CURRENT_DERP_REGION=
+    VPS_CURRENT_DERP_STUN=
     if [ "$VPS_CONFIG_PRESENT" = yes ]; then
         VPS_CURRENT_SERVER_URL=$(bootstrap_yaml_scalar "$VPS_CONFIG_PATH" server_url)
         VPS_CURRENT_LISTEN=$(bootstrap_yaml_scalar "$VPS_CONFIG_PATH" listen_addr)
@@ -494,6 +521,8 @@ vps_collect_facts() {
         VPS_CURRENT_TLS_KEY=$(bootstrap_yaml_scalar "$VPS_CONFIG_PATH" tls_key_path)
         VPS_CURRENT_TRUSTED_PROXIES=$(bootstrap_yaml_scalar "$VPS_CONFIG_PATH" trusted_proxies)
         VPS_CURRENT_DERP_ENABLED=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server enabled)
+        VPS_CURRENT_DERP_REGION=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server region_code)
+        VPS_CURRENT_DERP_STUN=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server stun_listen_addr)
     fi
     [ -n "$VPS_CURRENT_SERVER_URL" ] || VPS_CURRENT_SERVER_URL=unknown
     [ -n "$VPS_CURRENT_LISTEN" ] || VPS_CURRENT_LISTEN=unknown
@@ -503,6 +532,14 @@ vps_collect_facts() {
     [ -n "$VPS_CURRENT_TLS_KEY" ] || VPS_CURRENT_TLS_KEY=unknown-or-empty
     [ -n "$VPS_CURRENT_TRUSTED_PROXIES" ] || VPS_CURRENT_TRUSTED_PROXIES=unknown
     [ -n "$VPS_CURRENT_DERP_ENABLED" ] || VPS_CURRENT_DERP_ENABLED=unknown
+
+    # Embedded-DERP target state: an explicit CLI choice wins; otherwise the
+    # live config state is preserved so apply/update never silently flip it.
+    if [ "$VPS_ENABLE_DERP_EXPLICIT" = 1 ]; then
+        VPS_DERP_EFFECTIVE=$VPS_ENABLE_DERP
+    else
+        case "$VPS_CURRENT_DERP_ENABLED" in true) VPS_DERP_EFFECTIVE=true ;; *) VPS_DERP_EFFECTIVE=false ;; esac
+    fi
 
     VPS_DETECTED_DOMAIN=
     [ "$VPS_CURRENT_SERVER_URL" != unknown ] && VPS_DETECTED_DOMAIN=$(vps_extract_domain_from_url "$VPS_CURRENT_SERVER_URL")
@@ -665,6 +702,9 @@ vps_print_text_discover() {
     printf '  configured Headscale TLS paths: cert=%s key=%s\n' "$VPS_CURRENT_TLS_CERT" "$VPS_CURRENT_TLS_KEY"
     printf '  trusted_proxies baseline: %s\n' "$VPS_CURRENT_TRUSTED_PROXIES"
     printf '  embedded DERP enabled: %s\n' "$VPS_CURRENT_DERP_ENABLED"
+    if [ "$VPS_CURRENT_DERP_ENABLED" = true ]; then
+        printf '  embedded DERP region/stun: %s / %s\n' "${VPS_CURRENT_DERP_REGION:-unknown}" "${VPS_CURRENT_DERP_STUN:-unknown}"
+    fi
     printf '  effective domain: %s\n' "${VPS_EFFECTIVE_DOMAIN:-unknown}"
     printf '  DNS: %s; match=%s; addresses=%s\n' "$VPS_DNS_STATUS" "$VPS_DNS_MATCH" "${VPS_DNS_IPS:-none}"
     printf '  listeners 80/443: %s/%s\n' "$VPS_PORT_80" "$VPS_PORT_443"
@@ -702,6 +742,7 @@ vps_print_json_discover() {
     bootstrap_json_field tls_key_path "$VPS_CURRENT_TLS_KEY"
     bootstrap_json_field trusted_proxies "$VPS_CURRENT_TRUSTED_PROXIES"
     bootstrap_json_field embedded_derp_enabled "$VPS_CURRENT_DERP_ENABLED"
+    bootstrap_json_field embedded_derp_region "${VPS_CURRENT_DERP_REGION:-}"
     bootstrap_json_field domain "${VPS_EFFECTIVE_DOMAIN:-unknown}"
     bootstrap_json_field dns_status "$VPS_DNS_STATUS"
     bootstrap_json_field dns_match "$VPS_DNS_MATCH"
@@ -762,10 +803,6 @@ vps_compute_conflicts() {
     if [ "$VPS_DATA_PRESENT" = yes ] && [ "$VPS_CONFIG_PRESENT" != yes ]; then
         vps_plan_blocked=1
         vps_block_reasons="$vps_block_reasons data-present-without-config"
-    fi
-    if [ "$VPS_ENABLE_DERP" = true ]; then
-        vps_plan_blocked=1
-        vps_block_reasons="$vps_block_reasons embedded-derp-not-supported-in-this-build"
     fi
     [ -n "$VPS_EFFECTIVE_DOMAIN" ] || {
         vps_plan_blocked=1
@@ -845,6 +882,7 @@ vps_plan() {
         bootstrap_json_field domain "${VPS_EFFECTIVE_DOMAIN:-unknown}"
         bootstrap_json_field requested_version "${VPS_VERSION:-none}"
         bootstrap_json_field requested_embedded_derp "$VPS_ENABLE_DERP"
+        bootstrap_json_field effective_embedded_derp "$VPS_DERP_EFFECTIVE"
         bootstrap_json_field dns_status "$VPS_DNS_STATUS"
         bootstrap_json_field dns_match "$VPS_DNS_MATCH"
         bootstrap_json_field blocked_reasons "${vps_block_reasons# }"
@@ -856,7 +894,7 @@ vps_plan() {
         printf 'Detected:\n'
         printf '  domain: %s\n' "${VPS_EFFECTIVE_DOMAIN:-unknown}"
         printf '  proxy requested/effective: %s/%s\n' "$VPS_PROXY_MODE" "$VPS_EFFECTIVE_PROXY"
-        printf '  requested version/embedded DERP: %s/%s\n' "${VPS_VERSION:-none}" "$VPS_ENABLE_DERP"
+        printf '  requested version/embedded DERP: %s/%s (effective)\n' "${VPS_VERSION:-none}" "$VPS_DERP_EFFECTIVE"
         printf '  Headscale config/data: %s/%s\n' "$VPS_CONFIG_PRESENT" "$VPS_DATA_PRESENT"
         printf '  public listeners 80/443: %s/%s\n' "$VPS_PORT_80" "$VPS_PORT_443"
         printf '  admin listeners 8080/9090/50443: %s/%s/%s\n' "$VPS_PORT_8080" "$VPS_PORT_9090" "$VPS_PORT_50443"
@@ -871,6 +909,9 @@ vps_plan() {
         fi
         if [ "$VPS_CURRENT_TRUSTED_PROXIES" != '[127.0.0.1/32,::1/128]' ]; then
             printf '  - add only loopback trusted_proxies for the reverse proxy, preserving unrelated config\n'
+        fi
+        if [ "$VPS_DERP_EFFECTIVE" = true ]; then
+            printf '  - keep the embedded DERP enabled with managed region keys; verify UDP STUN + /derp/probe after restart\n'
         fi
         case "$VPS_EFFECTIVE_PROXY" in
             1panel) printf '  - back up and inspect the existing 1Panel proxy root; test then reload OpenResty only\n' ;;
@@ -958,6 +999,15 @@ vps_status() {
         VPS_STATUS_CODE=2
         VPS_STATUS_REASONS="$VPS_STATUS_REASONS derp-disabled-but-3478-listening"
     fi
+    if [ "$VPS_CURRENT_DERP_ENABLED" = true ] && bootstrap_command_exists ss; then
+        vps_status_stun_port=$(printf '%s\n' "$VPS_CURRENT_DERP_STUN" | awk -F: '{ print $NF }')
+        case "$vps_status_stun_port" in ''|*[!0-9]*) vps_status_stun_port=3478 ;; esac
+        case "$(vps_socket_state "$vps_status_stun_port" "$(ss -lun 2>/dev/null)")" in
+            present|public|unknown) ;;
+            *) VPS_STATUS_CODE=2
+               VPS_STATUS_REASONS="$VPS_STATUS_REASONS derp-enabled-but-stun-not-listening" ;;
+        esac
+    fi
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -970,6 +1020,7 @@ vps_status() {
         bootstrap_json_field service_enabled "$VPS_SERVICE_ENABLED"
         bootstrap_json_field safety "$VPS_SAFE_CONFIG"
         bootstrap_json_field safety_reasons "${VPS_STATUS_REASONS# }"
+        bootstrap_json_field embedded_derp_region "${VPS_CURRENT_DERP_REGION:-}"
         if [ "$VPS_STATUS_CODE" -eq 0 ]; then bootstrap_json_bool_field ok true; else bootstrap_json_bool_field ok false; fi
         bootstrap_json_end
     else
@@ -980,7 +1031,7 @@ vps_status() {
         printf '  local /health: %s\n' "$VPS_LOCAL_HEALTH"
         printf '  public /health: %s\n' "$VPS_PUBLIC_HEALTH"
         printf '  listeners admin 8080/9090/50443: %s/%s/%s\n' "$VPS_PORT_8080" "$VPS_PORT_9090" "$VPS_PORT_50443"
-        printf '  UDP 3478: %s (embedded DERP=%s)\n' "$VPS_PORT_3478_UDP" "$VPS_CURRENT_DERP_ENABLED"
+        printf '  UDP 3478: %s (embedded DERP=%s, region=%s)\n' "$VPS_PORT_3478_UDP" "$VPS_CURRENT_DERP_ENABLED" "${VPS_CURRENT_DERP_REGION:-n/a}"
         printf '  safety: %s (%s)\n' "$VPS_SAFE_CONFIG" "$VPS_CONFIG_SAFETY_REASON"
         if [ "$VPS_STATUS_CODE" -eq 0 ]; then
             printf 'OK\n'
@@ -1027,6 +1078,8 @@ vps_main() {
         ensure-user) vps_ensure_user ;;
         issue-key) vps_issue_key ;;
         approve-route) vps_approve_route ;;
+        enable-derp) vps_enable_derp ;;
+        disable-derp) vps_disable_derp ;;
         update) vps_update ;;
         rollback) vps_rollback ;;
         cleanup) vps_cleanup ;;

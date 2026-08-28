@@ -29,9 +29,6 @@ vps_conflict_or_die() {
     # Shared hard guards.  Mirrors vps_compute_conflicts (kept in sync with
     # plan) plus mutate-specific requirements.
     vps_refresh
-    if [ "$VPS_ENABLE_DERP" = true ]; then
-        die 'embedded DERP enablement is not supported in this build; refusing to proceed'
-    fi
     vps_compute_conflicts mutate
     if [ "$vps_plan_blocked" -eq 1 ]; then
         log_error "blocked preconditions: ${vps_block_reasons# }"
@@ -108,21 +105,84 @@ vps_install_deb() {
     return 0
 }
 
+vps_derp_region_defaults() {
+    # vps_derp_region_defaults SRC — resolve the embedded-region identity.
+    # Priority: explicit flags, then the identity already recorded in the
+    # config being rendered (so apply/update never rename a region), then a
+    # fresh derivation from the domain (first label, leading "hs-" stripped:
+    # hs-nosla.example.com -> "nosla").  The packaged defaults never count as
+    # a chosen identity.
+    vps_dr_src=$1
+    vps_dr_label=${VPS_EFFECTIVE_DOMAIN%%.*}
+    case "$vps_dr_label" in hs-*) vps_dr_label=${vps_dr_label#hs-} ;; esac
+    [ -n "$vps_dr_label" ] || vps_dr_label=headscale
+    vps_dr_cur_code=$(bootstrap_yaml_triple_scalar "$vps_dr_src" derp server region_code)
+    vps_dr_cur_name=$(bootstrap_yaml_triple_scalar "$vps_dr_src" derp server region_name)
+    vps_dr_code=${VPS_DERP_REGION_CODE_FLAG:-}
+    [ -n "$vps_dr_code" ] || {
+        case "$vps_dr_cur_code" in
+            ''|headscale) vps_dr_code=$vps_dr_label ;;
+            *) vps_dr_code=$vps_dr_cur_code ;;
+        esac
+    }
+    VPS_DERP_REGION_CODE=$vps_dr_code
+    if [ -n "$VPS_DERP_REGION_NAME_FLAG" ]; then
+        VPS_DERP_REGION_NAME=$VPS_DERP_REGION_NAME_FLAG
+    elif [ "$vps_dr_code" = "$vps_dr_cur_code" ] && [ -n "$vps_dr_cur_name" ] && [ "$vps_dr_cur_name" != 'Headscale Embedded DERP' ]; then
+        VPS_DERP_REGION_NAME=$vps_dr_cur_name
+    else
+        VPS_DERP_REGION_NAME=$(printf '%s\n' "$VPS_DERP_REGION_CODE" |
+            awk '{ printf "%s%s VPS\n", toupper(substr($0, 1, 1)), substr($0, 2) }')
+    fi
+}
+
+vps_derp_public_ipv4() {
+    # The embedded DERP map entry needs a real public IPv4.  Prefer the
+    # operator-provided address, else the DNS answer the conflict guards have
+    # already validated against this VPS.
+    if [ -n "$VPS_EXPECTED_PUBLIC_IP" ]; then
+        net_is_ipv4 "$VPS_EXPECTED_PUBLIC_IP" || return 1
+        printf '%s\n' "$VPS_EXPECTED_PUBLIC_IP"
+        return 0
+    fi
+    for vps_dr_ip in ${VPS_DNS_IPS:-}; do
+        if net_is_ipv4 "$vps_dr_ip"; then
+            printf '%s\n' "$vps_dr_ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 vps_render_config() {
     # vps_render_config SRC DST — rewrite only the managed keys.
     # Everything else passes through byte for byte.  trusted_proxies is
     # normalized to the loopback block list; an existing block list is
-    # consumed so no orphaned items remain.
+    # consumed so no orphaned items remain.  While the embedded DERP is
+    # enabled, the region identity keys and derp.server.ipv4 are managed too
+    # (the packaged documentation values 198.51.100.1 / 2001:db8::1 would
+    # otherwise leak into the DERP map handed to clients).
     render_src=$1
     render_dst=$2
     render_manage_tls=true
     [ "$VPS_EFFECTIVE_PROXY" = none ] && render_manage_tls=false
+    VPS_DERP_IPV4=
+    if [ "$VPS_DERP_EFFECTIVE" = true ]; then
+        vps_derp_region_defaults "$render_src" || return 1
+        VPS_DERP_IPV4=$(vps_derp_public_ipv4) || {
+            log_error 'cannot determine a public IPv4 for the embedded DERP map entry; pass --expected-public-ip'
+            return 1
+        }
+    fi
     awk \
         -v server_url="https://$VPS_EFFECTIVE_DOMAIN" \
         -v listen_addr="$VPS_LISTEN" \
         -v metrics_addr="$VPS_METRICS_LISTEN" \
         -v grpc_addr="$VPS_GRPC_LISTEN" \
-        -v derp_enabled="$VPS_ENABLE_DERP" \
+        -v derp_enabled="$VPS_DERP_EFFECTIVE" \
+        -v derp_region_code="$VPS_DERP_REGION_CODE" \
+        -v derp_region_name="$VPS_DERP_REGION_NAME" \
+        -v derp_ipv4="$VPS_DERP_IPV4" \
         -v manage_tls="$render_manage_tls" '
         function indent_of(s, n) { n = 0; while (substr(s, n + 1, 1) == " ") n++; return n }
         {
@@ -156,6 +216,35 @@ vps_render_config() {
                 saw["derp_enabled"] = 1
                 next
             }
+            if (in_derp_server && line ~ /^[[:space:]]*region_code[[:space:]]*:/) {
+                if (derp_enabled == "true") {
+                    printf "%*sregion_code: \"%s\"\n", server_indent + 2, "", derp_region_code
+                    saw["derp_region_code"] = 1
+                    next
+                }
+            }
+            if (in_derp_server && line ~ /^[[:space:]]*region_name[[:space:]]*:/) {
+                if (derp_enabled == "true") {
+                    printf "%*sregion_name: \"%s\"\n", server_indent + 2, "", derp_region_name
+                    saw["derp_region_name"] = 1
+                    next
+                }
+            }
+            if (in_derp_server && line ~ /^[[:space:]]*ipv4[[:space:]]*:/) {
+                if (derp_enabled == "true" && derp_ipv4 != "") {
+                    printf "%*sipv4: %s\n", server_indent + 2, "", derp_ipv4
+                    saw["derp_ipv4"] = 1
+                    next
+                }
+            }
+            if (in_derp_server && line ~ /^[[:space:]]*ipv6[[:space:]]*:/ && line !~ /^[[:space:]]*#/) {
+                # Neutralize the packaged documentation address only; a real
+                # operator-provided IPv6 passes through untouched.
+                if (derp_enabled == "true" && index(line, "2001:db8::1") > 0) {
+                    printf "%*s# ipv6: 2001:db8::1  # documentation value, not a real address\n", server_indent + 2, ""
+                    next
+                }
+            }
             print
         }
         END {
@@ -171,8 +260,18 @@ vps_render_config() {
                 print "  - 127.0.0.1/32"
                 print "  - ::1/128"
             }
+            if (derp_enabled == "true" && (!saw["derp_enabled"] || !saw["derp_region_code"] || !saw["derp_ipv4"])) {
+                print "render: derp.server baseline lacks the enabled/region_code/ipv4 keys; refusing to guess" > "/dev/stderr"
+                exit 1
+            }
         }
-    ' "$render_src" > "$render_dst"
+    ' "$render_src" > "$render_dst" || return 1
+    if [ "$VPS_DERP_EFFECTIVE" = true ]; then
+        [ -n "$(bootstrap_yaml_triple_scalar "$render_dst" derp server stun_listen_addr)" ] || {
+            log_error 'derp.server has no stun_listen_addr; the packaged baseline is expected to provide one'
+            return 1
+        }
+    fi
 }
 
 vps_config_fix_permissions() {
@@ -198,6 +297,7 @@ vps_config_write_transaction() {
         log_error 'headscale configtest rejected the rendered config; nothing was changed'
         return 1
     }
+    vps_derp_fix_key_ownership
     VPS_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
     VPS_BACKUP_ROOT=$(backup_allocate_directory "$(bootstrap_root_path "$VPS_BACKUP_DIR")" "$VPS_BACKUP_TIMESTAMP") || {
         log_error 'cannot allocate backup directory'
@@ -256,6 +356,42 @@ vps_public_health_ok() {
     [ "$(vps_health_code "https://$VPS_EFFECTIVE_DOMAIN/health")" = 200 ]
 }
 
+vps_derp_fix_key_ownership() {
+    # `headscale configtest` materializes the embedded-DERP private key under
+    # the invoking user the first time it validates an enabled config.  A root
+    # run (exactly how this script invokes it) would leave the key unreadable
+    # for the unit's User and headscale would crash-loop after the restart.
+    # Hand the key to the service user; on fixture roots there is nothing to
+    # chown.
+    vps_fko_key=$(bootstrap_root_path /var/lib/headscale/derp_server_private.key)
+    [ -f "$vps_fko_key" ] || return 0
+    [ "$BOOTSTRAP_ROOT" = / ] || return 0
+    vps_fko_user=$(awk -F= '$1 == "User" { gsub(/[",]/, "", $2); print $2; exit }' "$VPS_UNIT_PATH" 2>/dev/null)
+    [ -n "$vps_fko_user" ] || vps_fko_user=headscale
+    chown "$vps_fko_user" "$vps_fko_key" 2>/dev/null ||
+        log_warn "could not chown $vps_fko_key to $vps_fko_user; headscale may fail to start"
+    return 0
+}
+
+vps_verify_embedded_derp() {
+    # The embedded DERP is only useful when both faces answer: the UDP STUN
+    # listener from stun_listen_addr and the /derp/probe endpoint on the
+    # local Headscale listener.
+    vps_vd_stun=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server stun_listen_addr)
+    vps_vd_port=$(printf '%s\n' "$vps_vd_stun" | awk -F: '{ print $NF }')
+    case "$vps_vd_port" in ''|*[!0-9]*) vps_vd_port=3478 ;; esac
+    vps_vd_udp=$(ss -lun 2>/dev/null)
+    case "$(vps_socket_state "$vps_vd_port" "$vps_vd_udp")" in
+        present|public) ;;
+        *) log_error "UDP $vps_vd_port is not listening; the embedded DERP STUN face is down"; return 1 ;;
+    esac
+    case "$(vps_health_code "http://$VPS_LISTEN/derp/probe")" in
+        200) ;;
+        *) log_error 'local /derp/probe did not return 200; the embedded DERP relay face is down'; return 1 ;;
+    esac
+    return 0
+}
+
 vps_restart_and_verify() {
     systemctl restart headscale || { log_error 'systemctl restart headscale failed'; return 1; }
     if ! vps_wait_local_health "$VPS_HEALTH_ATTEMPTS"; then
@@ -264,17 +400,26 @@ vps_restart_and_verify() {
         systemctl restart headscale || true
         return 1
     fi
+    if [ "$VPS_DERP_EFFECTIVE" = true ] && ! vps_verify_embedded_derp; then
+        log_error 'embedded DERP verification failed after restart; rolling back config'
+        vps_restore_config_backup || log_error 'config rollback failed configtest; keeping new config'
+        systemctl restart headscale || true
+        return 1
+    fi
     return 0
 }
 
 vps_write_state() {
+    vps_ws_region=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server region_code)
     state_write "$(state_path_vps)" \
         domain "$VPS_EFFECTIVE_DOMAIN" \
         proxy_mode "$VPS_EFFECTIVE_PROXY" \
         headscale_version "$(vps_current_version)" \
         listen "$VPS_LISTEN" \
         metrics_listen "$VPS_METRICS_LISTEN" \
-        grpc_listen "$VPS_GRPC_LISTEN" || die 'failed to write state.json'
+        grpc_listen "$VPS_GRPC_LISTEN" \
+        embedded_derp "$VPS_DERP_EFFECTIVE" \
+        derp_region "${vps_ws_region:-n/a}" || die 'failed to write state.json'
     log_change "state.json updated: $(state_path_vps)"
 }
 
@@ -337,7 +482,7 @@ vps_install() {
         rm -f "$vps_tmp_config"
         die 'config transaction failed; no service restart was attempted'
     }
-    log_change 'rendered managed config keys (server_url, listen_addrs, trusted_proxies, embedded DERP off, TLS paths empty)'
+    log_change "rendered managed config keys (server_url, listen_addrs, trusted_proxies, embedded DERP $VPS_DERP_EFFECTIVE, TLS paths empty)"
 
     systemctl enable headscale || log_warn 'systemctl enable headscale failed'
     vps_restart_and_verify || die 'post-install verification failed'
@@ -409,6 +554,82 @@ vps_apply() {
     vps_write_state
 }
 
+vps_derp_converge_config() {
+    # Shared body for enable-derp/disable-derp: render (with the explicit
+    # flag applied), skip the restart when nothing changes, otherwise run the
+    # standard config transaction + verified restart.
+    vps_tmp_config=${TMPDIR:-/tmp}/headscale-config.$$.yaml
+    vps_render_config "$VPS_CONFIG_PATH" "$vps_tmp_config" || {
+        rm -f "$vps_tmp_config"
+        die 'config rendering failed'
+    }
+    if cmp -s "$vps_tmp_config" "$VPS_CONFIG_PATH"; then
+        rm -f "$vps_tmp_config"
+        log_info 'config already matches the requested embedded DERP state; no restart'
+        return 0
+    fi
+    vps_config_write_transaction "$vps_tmp_config" || {
+        rm -f "$vps_tmp_config"
+        die 'config transaction failed'
+    }
+    rm -f "$vps_tmp_config"
+    vps_restart_and_verify || die 'restart/health verification failed'
+    return 0
+}
+
+vps_derp_stun_port() {
+    vps_dsp_stun=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server stun_listen_addr)
+    vps_dsp_port=$(printf '%s\n' "$vps_dsp_stun" | awk -F: '{ print $NF }')
+    case "$vps_dsp_port" in ''|*[!0-9]*) vps_dsp_port=3478 ;; esac
+    printf '%s\n' "$vps_dsp_port"
+}
+
+vps_enable_derp() {
+    VPS_ENABLE_DERP=true
+    VPS_ENABLE_DERP_EXPLICIT=1
+    vps_require_root_real
+    vps_conflict_or_die
+    [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed; run install first'
+    [ "$VPS_CONFIG_PRESENT" = yes ] || die "no config at $VPS_CONFIG_PATH; run install/apply first"
+
+    vps_derp_converge_config
+
+    # The embedded DERP is a long-lived relay behind the reverse proxy; the
+    # 1Panel site needs the long read/send timeouts (nginx's 60s default
+    # would cut every relayed connection).  Caddy has no such default; the
+    # managed nginx template already carries the directives.
+    case "$VPS_EFFECTIVE_PROXY" in
+        1panel) vps_apply_1panel || die '1Panel proxy preparation failed (embedded DERP needs the long-connection directives)' ;;
+        caddy|nginx) printf 'Note: run apply to refresh the managed %s block (long-connection timeouts).\n' "$VPS_EFFECTIVE_PROXY" ;;
+    esac
+
+    vps_verify_embedded_derp || die 'embedded DERP did not come up (UDP STUN listener / /derp/probe)'
+
+    vps_ed_region=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server region_code)
+    vps_ed_ipv4=$(bootstrap_yaml_triple_scalar "$VPS_CONFIG_PATH" derp server ipv4)
+    log_change "embedded DERP enabled (region ${vps_ed_region:-unknown}, ipv4 ${vps_ed_ipv4:-unknown})"
+    vps_write_state
+    printf 'Embedded DERP enabled: region=%s, map entry ipv4=%s, STUN udp/%s.\n' \
+        "${vps_ed_region:-unknown}" "${vps_ed_ipv4:-unknown}" "$(vps_derp_stun_port)"
+    printf 'Firewalls are never touched: allow udp/%s inbound in any cloud security group.\n' "$(vps_derp_stun_port)"
+    printf 'Clients receive the region with the next netmap update; verify with: tailscale netcheck\n'
+}
+
+vps_disable_derp() {
+    VPS_ENABLE_DERP=false
+    VPS_ENABLE_DERP_EXPLICIT=1
+    vps_require_root_real
+    vps_conflict_or_die
+    [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed'
+    [ "$VPS_CONFIG_PRESENT" = yes ] || die "no config at $VPS_CONFIG_PATH; run install/apply first"
+
+    vps_derp_converge_config
+
+    log_change 'embedded DERP disabled (region keys and derp.urls preserved)'
+    vps_write_state
+    printf 'Embedded DERP disabled.  Region keys and derp.urls were preserved; clients fall back to derp.urls on the next netmap update.\n'
+}
+
 vps_proxy_backup_files() {
     # Back up the given proxy files into the shared backup layout.
     VPS_BACKUP_TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%Y%m%dT%H%M%SZ)
@@ -432,6 +653,8 @@ vps_proxy_backup_files() {
 
 vps_panel_required_directives() {
     # Print the directives that must be active inside the 1Panel proxy block.
+    # The long read/send timeouts matter for the embedded DERP relay and the
+    # long-polling noise connection; nginx's 60s default would cut both.
     printf '%s\n' \
         "proxy_pass http://$VPS_LISTEN;" \
         'proxy_http_version 1.1;' \
@@ -441,7 +664,9 @@ vps_panel_required_directives() {
         'proxy_set_header X-Real-IP $remote_addr;' \
         'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
         'proxy_set_header X-Forwarded-Proto $scheme;' \
-        'proxy_buffering off;'
+        'proxy_buffering off;' \
+        'proxy_read_timeout 3600s;' \
+        'proxy_send_timeout 3600s;'
 }
 
 vps_panel_prefix_present() {
@@ -480,6 +705,13 @@ EOF
             case "$vps_panel_directive" in
                 proxy_pass*|proxy_http_version*|proxy_buffering*)
                     printf '%s\n' "$vps_panel_active" | grep -qF "$vps_panel_directive" && continue
+                    ;;
+                proxy_read_timeout*|proxy_send_timeout*)
+                    # Any active value satisfies these; a different
+                    # operator-chosen value must not produce a duplicate
+                    # directive (nginx -t would reject it).
+                    vps_panel_prefix=$(printf '%s\n' "$vps_panel_directive" | awk '{ print $1 }')
+                    vps_panel_prefix_present "$vps_panel_prefix" "$vps_panel_active" && continue
                     ;;
                 *)
                     vps_panel_prefix=$(printf '%s\n' "$vps_panel_directive" | awk '{ print $1 " " $2 }')
@@ -893,6 +1125,7 @@ vps_update_step() {
         vps_rollback_to "$VPS_BACKUP_ROOT" || true
         return 1
     }
+    vps_derp_fix_key_ownership
     mv "$vps_tmp_config" "$VPS_CONFIG_PATH"
     vps_config_fix_permissions
     systemctl start headscale || {
@@ -906,6 +1139,11 @@ vps_update_step() {
         vps_rollback_to "$VPS_BACKUP_ROOT" || true
         return 1
     }
+    if [ "$VPS_DERP_EFFECTIVE" = true ] && ! vps_verify_embedded_derp; then
+        log_error 'embedded DERP not healthy after update; rolling back to the backup state'
+        vps_rollback_to "$VPS_BACKUP_ROOT" || true
+        return 1
+    fi
     if [ "$VPS_EFFECTIVE_PROXY" != none ] && ! vps_public_health_ok; then
         log_warn "public health not 200 after update (proxy may need attention)"
     fi

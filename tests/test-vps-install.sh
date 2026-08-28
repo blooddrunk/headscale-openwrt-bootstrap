@@ -274,4 +274,72 @@ OUT=$(env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$
 assert_contains "$OUT" 'Apply complete'
 assert_file_contains "$ROOT/etc/headscale/config.yaml" 'server_url: https://hs.example.com'
 
+################################################################
+# F. Embedded DERP: enable/disable, managed region keys, and
+#    preservation across apply (regression: the renderer used to
+#    hard-code derp enabled to false, silently disabling a relay
+#    configured manually or via enable-derp).
+################################################################
+
+make_fresh_root vps-f1
+CFG=$ROOT/etc/headscale/config.yaml
+f_run() {
+    env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+        "$VPS_SCRIPT" --root "$ROOT" "$@"
+}
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 install >/dev/null
+log_reset
+
+# F1. enable-derp with derived identity: first domain label minus "hs-",
+#     public IPv4 from --expected-public-ip, doc IPv6 neutralized, and the
+#     restart verified against the fixture STUN listener + /derp/probe.
+OUT=$(f_run --domain hs.example.com --expected-public-ip 203.0.113.10 enable-derp)
+assert_contains "$OUT" 'Embedded DERP enabled: region=hs'
+assert_contains "$OUT" 'udp/3478'
+assert_file_contains "$CFG" 'enabled: true'
+assert_file_contains "$CFG" 'region_code: "hs"'
+assert_file_contains "$CFG" 'region_name: "Hs VPS"'
+assert_file_contains "$CFG" 'ipv4: 203.0.113.10'
+assert_file_contains "$CFG" '# ipv6: 2001:db8::1'
+log_has 'systemctl restart headscale' || fail 'enable-derp must restart after a config change'
+
+# F2. explicit region naming converges and is then idempotent.
+f_run --derp-region-code custom --derp-region-name 'Custom Region' enable-derp >/dev/null
+assert_file_contains "$CFG" 'region_code: "custom"'
+assert_file_contains "$CFG" 'region_name: "Custom Region"'
+log_reset
+f_run --derp-region-code custom --derp-region-name 'Custom Region' enable-derp >/dev/null
+if log_has 'systemctl restart headscale'; then fail 'enable-derp restarted with nothing to change'; fi
+
+# F3. apply without DERP flags preserves the enabled state and the chosen
+#     region identity (no silent reset, no gratuitous restart).
+log_reset
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 apply >/dev/null
+assert_file_contains "$CFG" 'enabled: true'
+assert_file_contains "$CFG" 'region_code: "custom"'
+if log_has 'systemctl restart headscale'; then fail 'apply must not restart when the config already matches'; fi
+OUT=$(f_run plan)
+assert_contains "$OUT" 'requested version/embedded DERP: none/true (effective)'
+OUT=$(f_run status)
+assert_contains "$OUT" 'embedded DERP=true, region=custom'
+OUT=$(f_run --json status)
+assert_contains "$OUT" '"embedded_derp_region":"custom"'
+
+# F4. --enable-embedded-derp true drives the same convergence via apply.
+make_fresh_root vps-f2
+CFG=$ROOT/etc/headscale/config.yaml
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 install >/dev/null
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 --enable-embedded-derp true apply >/dev/null
+assert_file_contains "$CFG" 'enabled: true'
+assert_file_contains "$CFG" 'ipv4: 203.0.113.10'
+
+# F5. disable-derp flips the switch and keeps the region keys for a cheap
+#     re-enable; the STUN listener goes away with the config.
+f_run disable-derp >/dev/null
+assert_file_contains "$CFG" 'enabled: false'
+assert_file_contains "$CFG" 'region_code: "hs"'
+[ ! -f "$ROOT/.headscale-state/derp-enabled" ] || fail 'fixture STUN listener must be gone after disable-derp'
+OUT=$(f_run status)
+assert_contains "$OUT" 'embedded DERP=false'
+
 printf 'VPS install/apply/1panel tests passed.\n'

@@ -1,17 +1,32 @@
 #!/bin/sh
+ROOT=${FAKE_VPS_ROOT:-}
 LOG=${FAKE_LOG:-}
 [ -n "$LOG" ] && printf 'ss %s\n' "$*" >> "$LOG"
 
 if [ "${FAKE_SS_EMPTY:-0}" = 1 ]; then
     case "$*" in
-        *-lun*) printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n' ;;
+        *-lun*)
+            printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+            # FAKE_SS_EMPTY clears pre-existing listeners, not the stateful
+            # embedded-DERP STUN listener owned by the fixture service.
+            if [ -f "$ROOT/.headscale-state/derp-enabled" ]; then
+                printf 'UNCONN 0 0 *:3478 *:*\n'
+            fi
+            ;;
         *) printf 'Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n' ;;
     esac
     exit 0
 fi
 
 case "$*" in
-    *-lun*) printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n' ;;
+    *-lun*)
+        printf 'State Recv-Q Send-Q Local Address:Port Peer Address:Port\n'
+        # The embedded DERP's STUN listener reflects the derp-enabled marker
+        # the fixture headscale maintains on configtest.
+        if [ -f "$ROOT/.headscale-state/derp-enabled" ]; then
+            printf 'UNCONN 0 0 *:3478 *:*\n'
+        fi
+        ;;
     *)
         printf 'Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n'
         printf 'tcp LISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n'

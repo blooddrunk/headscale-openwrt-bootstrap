@@ -44,9 +44,10 @@ LuCI helper）叠加时，最常见的故障是"谁都在管同一个接口/IP/�
   "多 profile 与故障切换"）。
 - **秘密不落日志**：auth key 只输出一次（stdout 或 0600 权限的文件），
   `tailscaled.state`、数据库、TLS 私钥永不打印。
-- **默认最小权限**：exit node、IPv6 subnet routing、embedded DERP 默认
-  关闭（后两者本版未实现，显式请求会被拒绝）；subnet router 使用
-  Tailscale 自身 SNAT，fw4 tailscale zone 不额外开启 masquerade。
+- **默认最小权限**：exit node、IPv6 subnet routing 默认关闭（本版未实现）；
+  embedded DERP 默认关闭，由 `enable-derp` 显式开启并纳入托管键（见
+  "自建 DERP 中继"）；subnet router 使用 Tailscale 自身 SNAT，fw4
+  tailscale zone 不额外开启 masquerade。
 
 ## 快速开始
 
@@ -294,10 +295,12 @@ subnet router 需在新服务器重新批准。
 | `cleanup`                                         | 双端    | 删除脚本自管的内容（OpenWrt 含 failover 守护与 profile 登记表），保留数据/身份/软件包       |
 | `purge` / `purge-identity`                        | 双端    | 破坏性操作，必须 `--yes-i-understand`，执行前做最终备份                                     |
 | `ensure-user` / `issue-key` / `approve-route`     | VPS     | 用户与注册密钥管理、路由批准                                                                |
+| `enable-derp` / `disable-derp`                    | VPS     | 开/关内置 DERP 中继：托管 region 键与公网 IPv4，重启后验证 UDP STUN 与 `/derp/probe`        |
 
 常用参数：VPS 侧 `--domain`、`--expected-public-ip`、`--proxy`、
 `--listen/--metrics-listen/--grpc-listen`、`--version`（跨 minor 的
-`update` 还需 `--yes` 确认）、`--user`、`--expiration`、`--output`、
+`update` 还需 `--yes` 确认）、`--enable-embedded-derp`、
+`--derp-region-code/--derp-region-name`、`--user`、`--expiration`、`--output`、
 `--node-id`、`--route`；OpenWrt 侧
 `--login-server`、`--auth-key-file`、`--auth-key-stdin`、`--service-mode`、`--accept-dns`、
 `--accept-routes`、`--subnet`、`--min-client-version`、`--priority`、
@@ -310,7 +313,7 @@ subnet router 需在新服务器重新批准。
 
 | 模式     | 行为                                                                                                                                                                                                               |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `1panel` | 检测 1Panel OpenResty 容器（host 网络 + 挂载），只补齐已有站点缺失的必要指令（如 `proxy_buffering off;`），`openresty -t` 通过才 reload。站点和证书请先在 1Panel 界面创建（upstream 填 `http://127.0.0.1:8080`）。 |
+| `1panel` | 检测 1Panel OpenResty 容器（host 网络 + 挂载），只补齐已有站点缺失的必要指令（如 `proxy_buffering off;` 与 DERP 长连接所需的 `proxy_read/send_timeout`），`openresty -t` 通过才 reload。站点和证书请先在 1Panel 界面创建（upstream 填 `http://127.0.0.1:8080`）。 |
 | `caddy`  | 80/443 空闲时自动安装 Caddy，用 BEGIN/END 标记管理专属站点块，`caddy validate` 通过才重载。                                                                                                                        |
 | `nginx`  | 写入 `/etc/nginx/conf.d/headscale-bootstrap.conf`（标记块）。TLS 证书请在模板标注处自行提供，`nginx -t` 不过即还原。                                                                                               |
 | `none`   | 不管理任何反代；TLS 归属需自行明确。                                                                                                                                                                               |
@@ -318,6 +321,96 @@ subnet router 需在新服务器重新批准。
 
 域名必须直接解析到 VPS（Cloudflare 请用 DNS Only 灰云）；脚本从不修改
 DNS 记录，也从不读取 1Panel 保存的 Cloudflare token。
+
+## 自建 DERP 中继（enable-derp）
+
+概念：Tailscale 数据面优先打洞直连；失败时经 DERP 中继兜底。本部署默认
+不开内置 DERP，`derp.urls` 保留官方 map——兜底流量会绕道 Tailscale 官方
+节点（对中国大陆通常是东京或法兰克福），且不受自己控制。`enable-derp`
+把中继收回到你自己的 VPS 上：
+
+```sh
+# region 身份从域名推导（hs-nosla.example.com -> "nosla"）
+sudo ./headscale-vps.sh --domain hs.example.com --expected-public-ip <IP> enable-derp
+# 或显式命名
+sudo ./headscale-vps.sh --derp-region-code tokyo --derp-region-name 'Tokyo VPS' enable-derp
+sudo ./headscale-vps.sh disable-derp
+```
+
+行为边界：
+
+- **托管键**：`derp.server.enabled` + region code/name + `ipv4`。region
+  code 默认取域名首标签并去掉 `hs-` 前缀，已被 apply/update 继承不会
+  改名；`ipv4` 取 `--expected-public-ip` 或域名解析出的公网 IPv4。包内
+  示例的文档地址 `198.51.100.1`/`2001:db8::1` 会被替换/注释（否则会
+  进客户端 DERP map），真实自定义值不动。
+- **事务与修复**：标准 备份 → configtest → 重启 → 验证 流程，并自动
+  修复 `headscale configtest` 以 root 预生成 DERP 私钥导致的属主问题
+  （不修则服务 crash-loop）。验证 = UDP STUN 监听 + 本地 `/derp/probe`
+  200；`apply`/`update` 之后同样复验。`install`/`apply` 不带参数时
+  **保持当前开关状态**（`--enable-embedded-derp true|false` 显式覆盖）。
+- **反代**：DERP 是长连接。1panel 模式会补齐
+  `proxy_read/send_timeout 3600s`；nginx 模板已含同样指令（apply 刷新
+  托管块）；Caddy 默认无此问题。
+- **不做的事**：不动防火墙/云安全组——自行放行 STUN 端口（默认
+  udp/3478）入站；不改 `derp.urls`——官方 map 保留为兜底，客户端按
+  实测延迟自动择优。想强制只走自建就删掉 urls 里的官方条目再重启，
+  代价是失去第三方灾备。
+- **客户端**：无需任何改动，region 随 netmap 自动下发；`tailscale
+  netcheck` 可看到自建 region 及其 STUN 延迟。
+
+## 与透明代理共存（daed/dae、passwall2 等）
+
+路由器上的透明代理按"兜底走代理"接管 tailscale 流量时，后果不是变慢，
+而是**直连全灭**：
+
+- STUN（UDP 3478）被代理 → 节点对外 advertised 的公网端点变成代理
+  出口 VPS，NAT 穿越必然失败，全部回落 DERP 中继；
+- DERP/控制面（TLS 443）被代理 → 中继之上再套一层代理，跨洲多跳。
+
+识别特征：`tailscale netcheck` 的 `IPv4:` 是代理机 IP；`tailscale
+status` 显示 `relay "…"`；`tailscale ping` 报 `direct connection not
+established`。
+
+### daed/dae checklist
+
+每台**同时运行 tailscaled 或为 LAN 客户端当网关**的路由器都要加（放在
+geosite/geoip/fallback 之前）：
+
+```lua
+pname(tailscaled) -> must_direct          -- 路由器自身流量（仅本机进程可匹配）
+l4proto(udp) && dport(3478) -> direct     -- STUN，LAN 客户端靠这条救回
+domain(suffix: tailscale.com) -> direct   -- 官方 DERP（使用官方 map 时）
+domain(suffix: <login-server-域名>) -> direct  -- 控制面；每个 profile 的域名都要各加一条
+```
+
+- P2P 数据面无需单独规则：打洞成功后对端是真实公网 IP，已有的
+  `dip(geoip:cn)` / `dip(geoip:private) -> direct` 会接住（含国内 IPv6）。
+- 新登记 profile（如故障切换的备用 Headscale）时，同步补第四条 domain
+  规则。
+
+### passwall2 checklist（规则管理）
+
+passwall2 不支持按进程名匹配，且其生成器会把域名/IP 拆成独立 Xray
+路由规则（等效 OR），但 `端口` 字段会 AND 进每一条——"域名 + 端口
+3478"混在一条规则里 = 只匹配"该域名且端口 3478"= 匹配不到任何流量。
+必须拆两条，出站均选直连（_direct）：
+
+| 规则 | 域名 | 端口 | 网络协议 |
+| --- | --- | --- | --- |
+| tailscale-domains | `tailscale.com`、各 login server 域名 | 留空 | tcp,udp |
+| tailscale-stun | 留空（IP 也留空） | `3478` | 仅 udp |
+
+路由器自身 tailscaled 若被 passwall2 接管，只能靠目标 IP/端口命中上述
+规则，或确认 passwall2 未代理本机流量。
+
+### 验证
+
+```sh
+tailscale netcheck         # IPv4 应为真实宽带出口，而非代理机 IP
+tailscale ping <对端>       # 应出现 direct ...，而非 via DERP(...)
+tailscale status           # 对端行应显示 direct
+```
 
 ## 备份与回退
 
@@ -404,6 +497,8 @@ tests/                      fixture 测试与假命令（均为合成数据）
 
 - 1Panel 站点与 TLS 证书需在 1Panel 界面人工创建；脚本只负责校验与补齐
   站点内缺失的必要指令。
+- `enable-derp` 不管理防火墙/云安全组；STUN 端口（默认 udp/3478）需
+  自行放行，否则客户端 netcheck 只能看到 DERP 延迟而 STUN 超时。
 - nginx 模式不负责申请证书。
 - 不支持同时连接多个 Headscale 网络（官方客户端同一时刻只有一个活动
   tailnet）。多网络场景使用 profile 列表 + failover 在网络间串行切换

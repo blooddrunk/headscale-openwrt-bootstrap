@@ -58,6 +58,24 @@ case "$cmd" in
             printf 'configtest failed: broken fixture yaml\n' >&2
             exit 1
         fi
+        # Model the embedded-DERP side effects of validating an enabled
+        # config: the STUN listener comes up with the next service (re)start,
+        # and the DERP private key is materialized by the *invoking* user
+        # (root in production, which is exactly the ownership trap the script
+        # has to repair before restarting the unit).
+        if [ -n "$config_arg" ] && awk '
+            /^derp:/ && !seen { seen = 1; in_derp = 1; next }
+            seen && /^[^ #]/ { in_derp = 0 }
+            in_derp && /^[[:space:]]*enabled:[[:space:]]*true[[:space:]]*(#.*)?$/ { ok = 1; exit }
+            END { exit ok ? 0 : 1 }
+        ' "$config_arg" 2>/dev/null; then
+            : > "$STATE/derp-enabled"
+            mkdir -p "$ROOT/var/lib/headscale" 2>/dev/null
+            [ -f "$ROOT/var/lib/headscale/derp_server_private.key" ] || \
+                : > "$ROOT/var/lib/headscale/derp_server_private.key"
+        else
+            rm -f "$STATE/derp-enabled"
+        fi
         printf 'Configuration validated successfully.\n'
         ;;
     users)
