@@ -441,11 +441,8 @@ assert_contains "$OUT" 'Profile removed'
 new_key fourth
 run_ow --login-server "$A" --auth-key-file "$KEYFILE" profile-add >/dev/null
 # B is still the active network and not listed: profile-add adopts it
-# without a new login (the key stays unused on disk).
-new_key fifth
-run_ow --login-server "$B" --auth-key-file "$KEYFILE" profile-add >/dev/null
-[ -f "$KEYFILE" ] || fail 'adopt must not consume the auth key'
-rm -f "$KEYFILE"
+# without a new login and without requiring an auth key.
+run_ow --login-server "$B" profile-add >/dev/null
 run_ow enable-failover >/dev/null
 run_ow backup >/dev/null
 run_ow disable-failover >/dev/null
@@ -463,5 +460,82 @@ run_ow cleanup >/dev/null
 [ ! -e "$ROOT/usr/sbin/tailscale-failover" ] || fail 'cleanup must remove the watchdog'
 [ ! -e "$ROOT/etc/config/tailscale-bootstrap" ] || fail 'cleanup must remove the profile list'
 [ -f "$ROOT/.ts-state/prefs" ] || fail 'cleanup must keep identities'
+
+################################################################
+# I. Failure recovery and empty live-inventory diagnostics.
+################################################################
+
+make_fresh_root owf-reconcile
+run_ow --login-server "$A" install >/dev/null
+new_key initial
+run_ow --login-server "$A" --auth-key-file "$KEYFILE" profile-add >/dev/null
+new_key partial
+set +e
+OUT=$(env FAKE_OPENWRT_ROOT="$ROOT" FAKE_PARTIAL_TS_LOGIN=1 \
+    FAKE_LOG="$LOG" TMPDIR="$TMP_DIR" OPENWRT_SWITCH_SETTLE=0 PATH="$OPENWRT_BIN:$PATH" \
+    "$OPENWRT_SCRIPT" --root "$ROOT" --login-server "$B" \
+    --auth-key-file "$KEYFILE" --login-timeout 1 profile-add 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'partial login must fail'
+assert_contains "$OUT" 'target profile is present'
+assert_contains "$OUT" 'previous network restored'
+assert_contains "$OUT" 'no managed record was written'
+[ "$(cur_url)" = "$A" ] || fail "failed profile-add must restore $A, got $(cur_url)"
+if [ -f "$ROOT/etc/config/tailscale-bootstrap" ] && grep -qF -- "$B" "$ROOT/etc/config/tailscale-bootstrap"; then
+    fail 'failed profile-add must not record the new profile'
+fi
+[ -f "$KEYFILE" ] || fail 'regular auth key must be kept after login failure'
+rm -f "$KEYFILE"
+
+make_fresh_root owf-empty-inventory
+run_ow --login-server "$A" install >/dev/null
+mkdir -p "$ROOT/.ts-state"
+printf '{"ControlURL":"%s","CorpDNS":false,"RouteAll":false,"AdvertiseRoutes":[],"ExitNodeID":""}\n' "$A" > "$ROOT/.ts-state/prefs"
+: > "$ROOT/.ts-state/profiles"
+OUT=$(run_ow profile-list)
+assert_contains "$OUT" 'live profile inventory: empty'
+assert_contains "$OUT" 'current registration is not recorded'
+set +e
+OUT=$(run_ow --login-server "$A" profile-add 2>&1)
+CODE=$?
+set -e
+[ "$CODE" -ne 0 ] || fail 'empty live profile inventory must fail clearly'
+assert_contains "$OUT" 'has no discoverable row'
+assert_not_contains "$OUT" 'could not parse the tailscale profile entry'
+
+################################################################
+# J. Cancellation while reading an interactive stdin key is bounded and
+#    reconciles the previous network instead of exiting silently.  The test
+#    uses SIGTERM because non-interactive shells ignore SIGINT for background
+#    jobs; the production Ctrl+C path uses the same handler.
+################################################################
+
+make_fresh_root owf-cancel
+run_ow --login-server "$A" install >/dev/null
+new_key cancel-initial
+run_ow --login-server "$A" --auth-key-file "$KEYFILE" profile-add >/dev/null
+INPUT_FIFO=$TMP_DIR/owf-cancel-input
+OUTPUT_FILE=$TMP_DIR/owf-cancel-output
+mkfifo "$INPUT_FIFO"
+sleep 30 > "$INPUT_FIFO" &
+WRITER_PID=$!
+env FAKE_OPENWRT_ROOT="$ROOT" FAKE_LOG="$LOG" TMPDIR="$TMP_DIR" \
+    OPENWRT_SWITCH_SETTLE=0 PATH="$OPENWRT_BIN:$PATH" \
+    "$OPENWRT_SCRIPT" --root "$ROOT" --login-server "$B" --auth-key-stdin \
+    profile-add < "$INPUT_FIFO" > "$OUTPUT_FILE" 2>&1 &
+PID=$!
+sleep 1
+kill -TERM "$PID"
+set +e
+wait "$PID"
+CODE=$?
+set -e
+kill "$WRITER_PID" 2>/dev/null || true
+[ "$CODE" -eq 143 ] || fail "cancelled profile-add must exit 143, got $CODE"
+OUT=$(sed -n '1,200p' "$OUTPUT_FILE")
+assert_contains "$OUT" 'profile-add cancelled'
+assert_contains "$OUT" 'previous network remains active'
+[ "$(cur_url)" = "$A" ] || fail "cancelled profile-add must keep $A, got $(cur_url)"
 
 printf 'OpenWrt profile/failover tests passed.\n'

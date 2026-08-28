@@ -75,6 +75,27 @@ for arg in "$@"; do
     prev=$arg
 done
 
+# The real client supports a machine-readable profile inventory.  Keep the
+# fixture close enough to it for diagnostics and recovery tests; the bootstrap
+# script still retains its text-table fallback for older clients.
+if [ "$1" = switch ] && [ "$2" = --list ] && [ "$3" = --json ]; then
+    if [ ! -f "$PROFILES" ]; then
+        printf '[]\n'
+    else
+        cur=$(prefs_get ControlURL)
+        awk -F'|' -v cur="$cur" '
+            BEGIN { printf "["; sep = "" }
+            {
+                selected = ($4 == cur) ? "true" : "false"
+                printf "%s{\"id\":\"%s\",\"tailnet\":\"%s\",\"account\":\"%s\",\"selected\":%s}", sep, $1, $2, $3, selected
+                sep = ","
+            }
+            END { print "]" }
+        ' "$PROFILES"
+    fi
+    exit 0
+fi
+
 case "$1 $2" in
     'version '|'version'*)
         printf '%s\n' "${FAKE_TS_VERSION:-$(cat "$STATE_DIR/version" 2>/dev/null || printf 1.98.3)}"
@@ -115,7 +136,10 @@ case "$1 $2" in
         # marked by a trailing asterisk.  Columns are padded like the real
         # CLI, so every row (including the header) is re-padded whenever a
         # wider profile joins the list.
-        [ -f "$PROFILES" ] || exit 0
+        if [ ! -f "$PROFILES" ]; then
+            printf 'ID  Tailnet  Account\n'
+            exit 0
+        fi
         cur=$(prefs_get ControlURL)
         awk -F'|' -v cur="$cur" '
             {
@@ -126,7 +150,6 @@ case "$1 $2" in
                 if (length($3) > wac) wac = length($3)
             }
             END {
-                if (NDX == 0) exit
                 printf "%-*s  %-*s  %s\n", wid, "ID", wtn, "Tailnet", "Account"
                 for (i = 1; i <= NDX; i++)
                     printf "%-*s  %-*s  %s%s\n", wid, id[i], wtn, tn[i], ac[i], star[i]
@@ -165,6 +188,10 @@ case "$1 $2" in
         login_id=$(printf '01%02d' "$n")
         printf '%s|%s|%s|%s\n' "$login_id" "$(profile_host "$up_login_server")" "$login_name" "$up_login_server" >> "$PROFILES"
         write_prefs "$up_login_server" true false ''
+        if [ "${FAKE_PARTIAL_TS_LOGIN:-0}" = 1 ]; then
+            printf 'login interrupted after registration (injected)\n' >&2
+            exit 1
+        fi
         ;;
     'up '*|'up')
         printf '%s\n' "$*" | grep -q -- '--reset' && { printf 'fixture refuses --reset\n' >&2; exit 1; }

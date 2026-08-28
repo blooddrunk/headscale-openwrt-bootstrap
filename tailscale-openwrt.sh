@@ -45,6 +45,7 @@ OPENWRT_RECOVERY_THRESHOLD=
 OPENWRT_FAILBACK=
 OPENWRT_COOLDOWN=
 OPENWRT_PROBE_TIMEOUT=
+OPENWRT_LOGIN_TIMEOUT=120
 OPENWRT_HEALTH_PATH=
 OPENWRT_DELETE_IDENTITY=0
 OPENWRT_BACKUP_DIR=/root/tailscale-bootstrap-backups
@@ -55,13 +56,30 @@ BOOTSTRAP_UNDERSTAND=0
 BOOTSTRAP_JSON=0
 BOOTSTRAP_QUIET=0
 BOOTSTRAP_VERBOSE=0
+OPENWRT_PROFILE_ADD_ACTIVE=0
+OPENWRT_PROFILE_ADD_STAGE=
+OPENWRT_PROFILE_ADD_LOGIN_ATTEMPTED=0
+OPENWRT_PROFILE_ADD_UCI_COMMITTED=0
+OPENWRT_SIGNAL_EXIT_CODE=
+
+openwrt_handle_signal() {
+    openwrt_signal_code=$1
+    if [ "${OPENWRT_PROFILE_ADD_ACTIVE:-0}" = 1 ]; then
+        # Let profile-add inspect the live Tailscale state before exiting.  A
+        # login can finish server-side just as the user presses Ctrl+C.
+        OPENWRT_SIGNAL_EXIT_CODE=$openwrt_signal_code
+        return 0
+    fi
+    openwrt_auth_key_cleanup
+    exit "$openwrt_signal_code"
+}
 
 # A stdin-supplied auth key is materialized only for the duration of the
 # login operation.  The cleanup trap also covers die/exit paths after the
 # temporary file has been created.
 trap 'openwrt_auth_key_cleanup' 0
-trap 'openwrt_auth_key_cleanup; exit 130' INT
-trap 'openwrt_auth_key_cleanup; exit 143' HUP TERM
+trap 'openwrt_handle_signal 130' INT
+trap 'openwrt_handle_signal 143' HUP TERM
 
 openwrt_usage() {
     cat <<'EOF'
@@ -89,7 +107,8 @@ Mutating commands (backup -> validate -> apply -> verify, restore on failure):
   profile-add              Register --login-server as an ADDITIONAL tailscale
                            profile (tailscale login; the active network is
                            switched back afterwards), using --auth-key-file or
-                           --auth-key-stdin, and record it with --priority
+                           --auth-key-stdin only when a new login is needed,
+                           and record it with --priority
                            (lower wins; default appends +10).
   profile-remove           Drop --login-server from the profile list; add
                            --delete-identity to also log that profile out.
@@ -136,6 +155,7 @@ Options:
   --enable-subnet[=true|false]
   --allow-wan-udp[=true|false]
   --priority N             profile-add: priority, lower wins (default +10).
+  --login-timeout SEC      join/profile-add login wait limit (default 120).
   --delete-identity        profile-remove: also log the profile out.
   --check-interval SEC     enable-failover tuning (default 60, min 10).
   --failure-threshold N    failed probes before switching (default 3).
@@ -222,6 +242,7 @@ openwrt_validate_options() {
     [ -n "$OPENWRT_RECOVERY_THRESHOLD" ] && openwrt_validate_positive_int --recovery-threshold "$OPENWRT_RECOVERY_THRESHOLD"
     [ -n "$OPENWRT_COOLDOWN" ] && openwrt_validate_positive_int --cooldown "$OPENWRT_COOLDOWN"
     [ -n "$OPENWRT_PROBE_TIMEOUT" ] && openwrt_validate_positive_int --probe-timeout "$OPENWRT_PROBE_TIMEOUT"
+    [ -n "$OPENWRT_LOGIN_TIMEOUT" ] && openwrt_validate_positive_int --login-timeout "$OPENWRT_LOGIN_TIMEOUT"
     case "$OPENWRT_HEALTH_PATH" in
         '') ;;
         /*) ;;
@@ -335,6 +356,12 @@ openwrt_parse_args() {
                 shift 2
                 ;;
             --priority=*) OPENWRT_PRIORITY=${1#*=}; shift ;;
+            --login-timeout)
+                openwrt_need_value "$@"
+                OPENWRT_LOGIN_TIMEOUT=$2
+                shift 2
+                ;;
+            --login-timeout=*) OPENWRT_LOGIN_TIMEOUT=${1#*=}; shift ;;
             --delete-identity) OPENWRT_DELETE_IDENTITY=1; shift ;;
             --check-interval)
                 openwrt_need_value "$@"
@@ -581,8 +608,22 @@ openwrt_parse_prefs() {
     [ -n "$OPENWRT_TAILSCALE_IP4" ] || OPENWRT_TAILSCALE_IP4=unknown
 
     OPENWRT_SWITCH_LIST=$(tailscale switch --list 2>/dev/null)
-    if [ -n "$OPENWRT_SWITCH_LIST" ]; then
+    if printf '%s\n' "$OPENWRT_SWITCH_LIST" | awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            n = split(line, f, /[[:space:]]+/)
+            if (f[1] == "ID" && f[n] == "Account") next
+            found = 1
+        }
+        END { exit(found ? 0 : 1) }'; then
         OPENWRT_PROFILE_STATE=present
+    elif [ -n "$OPENWRT_SWITCH_LIST" ]; then
+        # Modern clients print the column header even when their profile
+        # inventory is empty.  Keep that distinct from an unavailable CLI.
+        OPENWRT_PROFILE_STATE=empty
     else
         OPENWRT_PROFILE_STATE=none-or-unavailable
     fi

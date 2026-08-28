@@ -437,6 +437,7 @@ openwrt_auth_key_cleanup() {
         fi
         OPENWRT_AUTH_KEY_TEMP=
     fi
+    unset OPENWRT_AUTH_KEY_VALUE
 }
 
 openwrt_auth_key_prepare_stdin() {
@@ -450,9 +451,21 @@ openwrt_auth_key_prepare_stdin() {
         die 'cannot secure the temporary auth key file'
     }
 
+    if [ -t 0 ] 2>/dev/null; then
+        log_warn 'waiting for one auth key line on stdin; paste it and press Enter (Ctrl+C cancels)'
+    else
+        log_info 'reading one auth key line from stdin (pipe one line or use --auth-key-file)'
+    fi
     OPENWRT_AUTH_KEY_VALUE=
     IFS= read -r OPENWRT_AUTH_KEY_VALUE
     openwrt_auth_key_read_status=$?
+    if [ -n "${OPENWRT_SIGNAL_EXIT_CODE:-}" ]; then
+        openwrt_auth_key_cleanup
+        if [ "${OPENWRT_PROFILE_ADD_ACTIVE:-0}" = 1 ]; then
+            openwrt_profile_add_abort_if_signaled
+        fi
+        exit "$OPENWRT_SIGNAL_EXIT_CODE"
+    fi
     if [ "$openwrt_auth_key_read_status" -ne 0 ] && [ -z "$OPENWRT_AUTH_KEY_VALUE" ]; then
         openwrt_auth_key_cleanup
         die 'no auth key was received on stdin'
@@ -612,9 +625,10 @@ EOF
     tailscale up \
         --login-server="$OPENWRT_EFFECTIVE_LOGIN_SERVER" \
         --auth-key="file:$OPENWRT_AUTH_KEY_FILE" \
+        --timeout="${OPENWRT_LOGIN_TIMEOUT}s" \
         --accept-dns="$OPENWRT_ACCEPT_DNS" \
         --accept-routes="$OPENWRT_ACCEPT_ROUTES" || {
-        log_error 'tailscale up failed'
+        log_error "tailscale up failed or timed out after ${OPENWRT_LOGIN_TIMEOUT}s"
         openwrt_auth_key_login_failed
         exit 1
     }
@@ -1082,8 +1096,15 @@ openwrt_ts_entry_for_url() {
     printf '%s\n' "$1" | awk -v host="$openwrt_tef_host" '
         {
             line = $0
+            sub(/^[[:space:]]+/, "", line)
             sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
-            if (split(line, f, /[[:space:]]+/) >= 3 && f[2] == host) { print line; found = 1; exit }
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            n = split(line, f, /[[:space:]]+/)
+            # The real CLI prints this header even when there are no profiles.
+            # It must not count as the single-entry fallback candidate.
+            if (f[1] == "ID" && f[n] == "Account") next
+            if (n >= 3 && f[2] == host) { print line; found = 1; exit }
             lines[++cnt] = line
         }
         END { if (!found && cnt == 1) print lines[1] }'
@@ -1097,8 +1118,13 @@ openwrt_ts_entries_strict_for_url() {
     printf '%s\n' "$1" | awk -v host="$openwrt_tes_host" '
         {
             line = $0
+            sub(/^[[:space:]]+/, "", line)
             sub(/[[:space:]]*\*[[:space:]]*$/, "", line)
-            if (split(line, f, /[[:space:]]+/) >= 3 && f[2] == host) print line
+            sub(/[[:space:]]+$/, "", line)
+            if (line == "") next
+            n = split(line, f, /[[:space:]]+/)
+            if (f[1] == "ID" && f[n] == "Account") next
+            if (n >= 3 && f[2] == host) print line
         }'
 }
 
@@ -1239,6 +1265,7 @@ openwrt_profile_list() {
         bootstrap_json_field config "${OPENWRT_CONFIG_BOOTSTRAP}"
         bootstrap_json_field profile_count "$OPENWRT_PROFILE_COUNT"
         bootstrap_json_field profiles "${OPENWRT_PROFILE_URLS:-none}"
+        bootstrap_json_field profile_inventory "$OPENWRT_PROFILE_STATE"
         bootstrap_json_field current_control_url "$OPENWRT_CURRENT_CONTROL_URL"
         bootstrap_json_field failover_enabled "$OPENWRT_FAILOVER_ENABLED"
         bootstrap_json_field failover_service "$OPENWRT_INIT_FAILOVER_PRESENT"
@@ -1257,6 +1284,13 @@ openwrt_profile_list() {
             "$([ -n "$openwrt_pl_id" ] && printf ", ts_id %s" "$openwrt_pl_id")"
     done
     printf '  current ControlURL: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
+    if [ "${OPENWRT_PROFILE_COUNT:-0}" -eq 0 ] && \
+        [ "$OPENWRT_PREFS_READABLE" = yes ] && \
+        [ -n "$OPENWRT_CURRENT_CONTROL_URL" ] && [ "$OPENWRT_CURRENT_CONTROL_URL" != unknown ]; then
+        printf '  live profile inventory: %s\n' "$OPENWRT_PROFILE_STATE"
+        printf '  hint: current registration is not recorded; run %s --login-server %s profile-add\n' \
+            "$OPENWRT_PROGRAM" "$OPENWRT_CURRENT_CONTROL_URL"
+    fi
     printf '  failover: %s (service %s, interval %ss, failure %s, recovery %s, failback %s, cooldown %ss)\n' \
         "$OPENWRT_FAILOVER_ENABLED" "$OPENWRT_INIT_FAILOVER_PRESENT" \
         "${OPENWRT_FAILOVER_INTERVAL:-60}" "${OPENWRT_FAILOVER_FAILURE_THRESHOLD:-3}" \
@@ -1266,11 +1300,78 @@ openwrt_profile_list() {
     return 0
 }
 
+openwrt_profile_add_reconcile() {
+    # Inspect the live client after a failed/interrupted login.  Tailscale may
+    # have created the profile server-side even when the CLI exits non-zero,
+    # so blindly reporting "login failed" can leave the operator unsure which
+    # network is active.  Never write a new UCI profile from this recovery
+    # path; a later profile-add can safely adopt a discovered profile.
+    openwrt_par_reason=${1:-profile-add did not complete}
+    openwrt_par_list=$(tailscale switch --list 2>/dev/null || :)
+    openwrt_refresh
+    openwrt_par_entry=
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ]; then
+        openwrt_par_entry=$(openwrt_ts_current_entry "$openwrt_par_list")
+        [ -n "$openwrt_par_entry" ] || \
+            openwrt_par_entry=$(openwrt_ts_entry_for_url "$openwrt_par_list" "$openwrt_pa_target")
+    fi
+
+    # Restore the network that was active before profile-add whenever the
+    # interrupted login made the requested target current.  This is best
+    # effort: a failure is reported explicitly and never hidden.
+    if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ] && \
+        [ "${OPENWRT_PROFILE_ADD_LOGIN_ATTEMPTED:-0}" = 1 ] && \
+        [ -n "${openwrt_pa_prev_url:-}" ] && [ "$openwrt_pa_prev_url" != unknown ] && \
+        [ "$openwrt_pa_prev_url" != "$openwrt_pa_target" ] && [ -n "${openwrt_pa_prev_name:-}" ]; then
+        if openwrt_ts_switch "$openwrt_pa_prev_name" "${openwrt_pa_prev_id:-}"; then
+            openwrt_refresh
+            if [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_prev_url" ]; then
+                log_warn "$openwrt_par_reason; previous network restored: $openwrt_pa_prev_url"
+            else
+                log_warn "$openwrt_par_reason; switch-back verification mismatch: $OPENWRT_CURRENT_CONTROL_URL"
+            fi
+        else
+            log_warn "$openwrt_par_reason; could not restore previous network $openwrt_pa_prev_url"
+        fi
+    fi
+
+    if [ -n "$openwrt_par_entry" ]; then
+        if [ "${OPENWRT_PROFILE_ADD_UCI_COMMITTED:-0}" = 1 ]; then
+            log_warn "target profile is present and the managed record was already committed; current ControlURL=$OPENWRT_CURRENT_CONTROL_URL"
+        else
+            log_warn "target profile is present, but no managed record was written; re-run profile-add without an auth key to adopt it"
+        fi
+    elif [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ]; then
+        log_warn "current ControlURL is $openwrt_pa_target, but the live profile list has no discoverable profile row; no managed record was written"
+    elif [ "$OPENWRT_CURRENT_CONTROL_URL" = "${openwrt_pa_prev_url:-}" ]; then
+        log_warn "previous network remains active; no managed record was written"
+    else
+        log_warn "current ControlURL after recovery: $OPENWRT_CURRENT_CONTROL_URL; no managed record was written"
+    fi
+}
+
+openwrt_profile_add_abort_if_signaled() {
+    [ -n "${OPENWRT_SIGNAL_EXIT_CODE:-}" ] || return 0
+    openwrt_pa_signal_code=$OPENWRT_SIGNAL_EXIT_CODE
+    openwrt_pa_signal_stage=${OPENWRT_PROFILE_ADD_STAGE:-operation}
+    log_warn "profile-add cancelled during $openwrt_pa_signal_stage; checking the live registration"
+    if [ -n "${openwrt_pa_target:-}" ]; then
+        openwrt_profile_add_reconcile 'profile-add was cancelled'
+    fi
+    OPENWRT_PROFILE_ADD_ACTIVE=0
+    openwrt_auth_key_cleanup
+    exit "$openwrt_pa_signal_code"
+}
+
 openwrt_profile_add() {
     openwrt_require_root_real
     bootstrap_is_https_url "$OPENWRT_LOGIN_SERVER" || die 'profile-add requires --login-server https://...'
-    openwrt_auth_key_require_source profile-add
+    OPENWRT_PROFILE_ADD_ACTIVE=1
+    OPENWRT_PROFILE_ADD_STAGE=preflight
+    OPENWRT_PROFILE_ADD_LOGIN_ATTEMPTED=0
+    OPENWRT_PROFILE_ADD_UCI_COMMITTED=0
     openwrt_refresh
+    openwrt_profile_add_abort_if_signaled
     openwrt_client_version_gate
 
     openwrt_pa_target=$OPENWRT_LOGIN_SERVER
@@ -1284,9 +1385,11 @@ openwrt_profile_add() {
     # A different target server is the normal case here, not a conflict.
     openwrt_profile_guard
 
-    tailscale switch --list >/dev/null 2>&1 || die 'tailscale switch --list failed; this client cannot manage profiles'
-
-    openwrt_pa_before=$(tailscale switch --list 2>/dev/null || :)
+    OPENWRT_PROFILE_ADD_STAGE=profile-discovery
+    if ! openwrt_pa_before=$(tailscale switch --list 2>/dev/null); then
+        die 'tailscale switch --list failed; this client cannot manage profiles'
+    fi
+    openwrt_profile_add_abort_if_signaled
     openwrt_pa_prev_entry=$(openwrt_ts_current_entry "$openwrt_pa_before")
     openwrt_pa_prev_name=
     openwrt_pa_prev_id=
@@ -1298,26 +1401,43 @@ openwrt_profile_add() {
 
     if [ "$openwrt_pa_prev_url" = "$openwrt_pa_target" ]; then
         # Adopt the current registration instead of logging in again.
-        openwrt_pa_entry=$(openwrt_ts_entry_for_url "$openwrt_pa_before" "$openwrt_pa_target")
+        # The selected row is authoritative here; the Tailnet display column
+        # is not guaranteed to equal the login-server hostname.
+        openwrt_pa_entry=$openwrt_pa_prev_entry
+        [ -n "$openwrt_pa_entry" ] || \
+            openwrt_pa_entry=$(openwrt_ts_entry_for_url "$openwrt_pa_before" "$openwrt_pa_target")
         if [ -z "$openwrt_pa_entry" ]; then
-            die 'cannot map the current registration to a tailscale profile; register this server via profile-add from another network, or purge-identity first'
+            die 'current ControlURL is registered, but the live profile list has no discoverable row; inspect tailscale switch --list --json and restore the client profile inventory before retrying'
         fi
         log_info "adopting the current registration on $openwrt_pa_target"
         openwrt_converge_prefs
     else
         # tailscale login creates a NEW profile; it never reconfigures the
         # current one, so the active network is preserved until we switch back.
+        OPENWRT_PROFILE_ADD_STAGE=auth-key-input
+        openwrt_auth_key_require_source profile-add
         openwrt_auth_key_prepare_stdin
-        tailscale login \
+        openwrt_profile_add_abort_if_signaled
+        OPENWRT_PROFILE_ADD_STAGE=login
+        OPENWRT_PROFILE_ADD_LOGIN_ATTEMPTED=1
+        if ! tailscale login \
             --login-server="$openwrt_pa_target" \
-            --auth-key="file:$OPENWRT_AUTH_KEY_FILE" || {
-            log_error 'tailscale login failed'
+            --auth-key="file:$OPENWRT_AUTH_KEY_FILE" \
+            --timeout="${OPENWRT_LOGIN_TIMEOUT}s"; then
+            log_error "tailscale login failed or timed out after ${OPENWRT_LOGIN_TIMEOUT}s"
+            openwrt_profile_add_reconcile 'tailscale login failed or timed out'
             openwrt_auth_key_login_failed
+            OPENWRT_PROFILE_ADD_ACTIVE=0
+            if [ -n "${OPENWRT_SIGNAL_EXIT_CODE:-}" ]; then
+                exit "$OPENWRT_SIGNAL_EXIT_CODE"
+            fi
             exit 1
-        }
+        fi
         openwrt_auth_key_remove_after_success
 
+        OPENWRT_PROFILE_ADD_STAGE=post-login-verification
         openwrt_refresh
+        openwrt_profile_add_abort_if_signaled
         [ "$OPENWRT_CURRENT_CONTROL_URL" = "$openwrt_pa_target" ] || \
             die "ControlURL mismatch after login: $OPENWRT_CURRENT_CONTROL_URL"
         [ "$OPENWRT_TAILSCALE_IP4" != unknown ] && [ -n "$OPENWRT_TAILSCALE_IP4" ] || \
@@ -1326,11 +1446,19 @@ openwrt_profile_add() {
         # Converge the safe prefs while the new profile is current.
         openwrt_converge_prefs
 
-        openwrt_pa_after=$(tailscale switch --list 2>/dev/null || :)
+        OPENWRT_PROFILE_ADD_STAGE=profile-discovery
+        if ! openwrt_pa_after=$(tailscale switch --list 2>/dev/null); then
+            log_error 'could not read the live profile list after login; no managed profile was written'
+            openwrt_profile_add_reconcile 'live profile-list lookup failed after login'
+            OPENWRT_PROFILE_ADD_ACTIVE=0
+            exit 1
+        fi
+        openwrt_profile_add_abort_if_signaled
         openwrt_pa_entry=$(openwrt_ts_new_entry "$openwrt_pa_before" "$openwrt_pa_after")
         if [ -z "$openwrt_pa_entry" ]; then
-            log_error 'could not identify the new tailscale profile (list unchanged)'
-            log_warn 'the node is now registered on the new network; fix the profile list manually or purge-identity'
+            log_error 'could not identify the new tailscale profile: the live profile list has no new row'
+            openwrt_profile_add_reconcile 'profile discovery did not find a new row'
+            OPENWRT_PROFILE_ADD_ACTIVE=0
             exit 1
         fi
     fi
@@ -1340,10 +1468,12 @@ openwrt_profile_add() {
     openwrt_pa_id=${openwrt_pa_fields#*|}
     [ -n "$openwrt_pa_name" ] || {
         log_error "could not parse the tailscale profile entry: $openwrt_pa_entry"
-        log_warn 'if this followed a login, the node is now registered on the new network; fix the profile list manually or purge-identity'
+        openwrt_profile_add_reconcile 'profile entry parsing failed'
+        OPENWRT_PROFILE_ADD_ACTIVE=0
         exit 1
     }
 
+    OPENWRT_PROFILE_ADD_STAGE=profile-record
     openwrt_pa_section=$(openwrt_profile_section_name "$openwrt_pa_target")
     if [ -n "$OPENWRT_PRIORITY" ]; then
         openwrt_pa_priority=$OPENWRT_PRIORITY
@@ -1365,9 +1495,11 @@ openwrt_profile_add() {
     uci commit "$OPENWRT_UCI_TSBOOT" || die "uci commit $OPENWRT_UCI_TSBOOT failed"
     uci -q get "$OPENWRT_UCI_TSBOOT.$openwrt_pa_section.login_server" >/dev/null 2>&1 || \
         die 'profile section missing after commit'
+    OPENWRT_PROFILE_ADD_UCI_COMMITTED=1
     log_change "profile recorded: $openwrt_pa_target (section $openwrt_pa_section, priority $openwrt_pa_priority, ts_profile $openwrt_pa_name)"
 
     # Switch back so adding a backup never yanks the active network away.
+    OPENWRT_PROFILE_ADD_STAGE=switch-back
     if [ -n "$openwrt_pa_prev_url" ] && [ "$openwrt_pa_prev_url" != unknown ] && \
         [ "$openwrt_pa_prev_url" != "$openwrt_pa_target" ] && [ -n "$openwrt_pa_prev_name" ]; then
         if openwrt_ts_switch "$openwrt_pa_prev_name" "$openwrt_pa_prev_id"; then
@@ -1382,8 +1514,11 @@ openwrt_profile_add() {
         fi
     fi
 
+    openwrt_profile_add_abort_if_signaled
+    OPENWRT_PROFILE_ADD_STAGE=finalize
     openwrt_refresh
     openwrt_write_state
+    OPENWRT_PROFILE_ADD_ACTIVE=0
     printf 'Profile added: %s (priority %s, ts_profile %s).\n' "$openwrt_pa_target" "$openwrt_pa_priority" "$openwrt_pa_name"
     printf 'Active network after profile-add: %s\n' "$OPENWRT_CURRENT_CONTROL_URL"
 }

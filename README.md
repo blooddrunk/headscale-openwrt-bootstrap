@@ -115,9 +115,14 @@ printf '%s\n' "$AUTH_KEY" | ./tailscale-openwrt.sh \
     --login-server https://hs.example.com --auth-key-stdin join
 ```
 
-`profile-add` 同样支持这两种输入方式，且必须给出其中一种——即使节点
-已注册到目标网络、无需重新登录（收编场景不读取 stdin），flag 本身
-也不能省。
+`profile-add` 同样支持这两种输入方式；需要新登录时必须给出其中一种，
+如果节点已经注册到目标网络，脚本会直接
+收编当前 profile，不读取 stdin，也不需要 auth key。
+
+`join`/`profile-add` 默认给 Tailscale 登录等待 120 秒，避免网络或服务端
+异常时无限 pending；可用 `--login-timeout SEC` 调整。登录超时或 Ctrl+C
+后，脚本会检查 ControlURL 和 live profile list，尽力切回原网络，并提示
+是否可以不带 auth key 重跑 `profile-add` 完成收编。
 
 `enable-subnet` 会自动从 `ubus` 读取 LAN 地址并正确计算网络 CIDR（例如
 192.168.10.129/25 → 192.168.10.128/25），随后停在"已广告、等待批准"
@@ -190,7 +195,7 @@ profile 列表保存在项目自有的 `/etc/config/tailscale-bootstrap`，与
 ```sh
 # 已通过 join 注册到当前网络时，不会重新登录，也不会读取 stdin
 ./tailscale-openwrt.sh --login-server https://hs-a.example.com \
-    --auth-key-stdin --priority 10 profile-add
+    --priority 10 profile-add
 ```
 
 ```sh

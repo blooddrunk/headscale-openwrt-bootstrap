@@ -252,6 +252,7 @@ UP_LINE=$(grep -F 'tailscale up' "$LOG" | head -n 1)
 [ -n "$UP_LINE" ] || fail 'tailscale up not called'
 assert_contains "$UP_LINE" "--login-server=$LOGIN"
 assert_contains "$UP_LINE" '--auth-key=file:'
+assert_contains "$UP_LINE" '--timeout=120s'
 assert_contains "$UP_LINE" '--accept-dns=false'
 assert_contains "$UP_LINE" '--accept-routes=false'
 assert_not_contains "$UP_LINE" '--reset'

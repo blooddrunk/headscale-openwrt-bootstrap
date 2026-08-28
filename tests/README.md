@@ -28,7 +28,8 @@ forks like Kwrt; the script must fall back to `fw4 reload`),
 committed config still passes `fw4 check`), `FAKE_FAIL_OPENRESTY_T=1`,
 `FAKE_FAIL_CONFIGTEST=1`, `FAKE_FAIL_OPKG=1`,
 `FAKE_FAIL_AUTH=1`, `FAKE_FAIL_TS_UP=1`, `FAKE_FAIL_TS_LOGIN=1`,
-`FAKE_FAIL_TS_SWITCH=1`, `FAKE_PROBE_DOWN="host1 host2"` (fake curl
+`FAKE_FAIL_TS_SWITCH=1`, `FAKE_PARTIAL_TS_LOGIN=1`,
+`FAKE_PROBE_DOWN="host1 host2"` (fake curl
 probe failures for the failover watchdog), `FAKE_MISMATCH_DEB=1`,
 `FAKE_LOCAL_HEALTH=503`, `FAKE_RELEASE_TAGS="..."`,
 `FAKE_HEALTH_DELAY=N` (the first N local /health probes answer 000,
