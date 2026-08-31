@@ -412,6 +412,37 @@ tailscale ping <对端>       # 应出现 direct ...，而非 via DERP(...)
 tailscale status           # 对端行应显示 direct
 ```
 
+### LAN 客户端自己也在跑 Tailscale（DNS 接管冲突）
+
+上面各节是"代理接管 tailscale 流量"；这里反过来：tailnet 接管客户端
+的 DNS。LAN 内装了 Tailscale 的设备（如 Windows PC）默认
+accept-dns=true，会应用控制端下发的 DNS 配置——若 tailnet 配了全局
+解析器（如 1.1.1.1/1.0.0.1），该设备的一切解析都改道 tailscaled 的
+本地代理 100.100.100.100 再转给全局解析器：绕开 daed 按域名分流的
+设计，国内环境下直连 1.1.1.1 解析还会被污染。典型症状：设备一连上
+Tailscale，DNS 就全坏。
+
+处理：在该设备上拒绝 DNS 接管，并清掉已缓存的坏结果：
+
+```sh
+tailscale set --accept-dns=false
+# 然后清本地 DNS 缓存：
+#   Windows:  ipconfig /flushdns
+#   Linux:    resolvectl flush-caches
+#   macOS:    killall -HUP mDNSResponder
+```
+
+代价：MagicDNS 名字（<机器名>.<base_domain>）在该设备上不再可解析，
+设备互访改用 tailscale IP（`tailscale status` 可查）。想保留
+MagicDNS，可去控制端（官方管理台的 DNS 页，或 Headscale 配置的
+dns 节）移除全局解析器、或改为 split DNS——没有全局解析器时，
+100.100.100.100 只应答 MagicDNS 名字，其余查询回退给系统原 DNS
+（即路由器/daed），两者即可共存。
+
+路由器侧无需改动：join 默认 `--accept-dns=false`，apply 与 failover
+都会收敛漂移，status 会把 accept-dns=true 标为 unsafe-accept-dns。
+LAN 客户端设备不归脚本管，需如上逐台手动设置。
+
 ## 备份与回退
 
 - VPS 默认备份目录：`/var/backups/headscale-bootstrap/`
@@ -511,3 +542,5 @@ tests/                      fixture 测试与假命令（均为合成数据）
   即为自动检查）。
 - LuCI 界面里的"启用/停止/重启 Tailscale"按钮在本部署中不可用，daemon
   由 `tailscale-core` 管理。
+- 脚本管不到 LAN 客户端设备（如 Windows）上的 Tailscale 偏好；透明
+  代理共存场景下客户端侧的 accept-dns 设置见"与透明代理共存"。
