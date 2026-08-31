@@ -424,7 +424,8 @@ accept-dns=true，会应用控制端下发的 DNS 配置——若 tailnet 配了
 设计，国内环境下直连 1.1.1.1 解析还会被污染。典型症状：设备一连上
 Tailscale，DNS 就全坏。
 
-处理：在该设备上拒绝 DNS 接管，并清掉已缓存的坏结果：
+处理分两层。客户端急修（立即恢复 DNS）：拒绝接管并清掉已缓存的坏
+结果：
 
 ```sh
 tailscale set --accept-dns=false
@@ -434,17 +435,23 @@ tailscale set --accept-dns=false
 #   macOS:    killall -HUP mDNSResponder
 ```
 
-代价：MagicDNS 名字（<机器名>.<base_domain>）在该设备上不再可解析，
-设备互访改用 tailscale IP（`tailscale status` 可查）。想保留
-MagicDNS，可去控制端（官方管理台的 DNS 页，或 Headscale 配置的
-dns 节）移除全局解析器、或改为 split DNS——没有全局解析器时，
-100.100.100.100 只应答 MagicDNS 名字，其余查询回退给系统原 DNS
-（即路由器/daed），两者即可共存。Headscale 侧直接用本仓库的
-`enable-magic-dns`：它托管 dns 节、把全局解析器清空并把
-`override_local_dns` 关掉（默认基域 `ts.<域名>`）。注意 headscale
-打包示例自带 `magic_dns: true` + 全局解析器 1.1.1.1/1.0.0.1，
-`install` 原样透传——`status` 会以 `dns-global-resolvers-pushed`
-提示这一冲突，直到运行 enable/disable-magic-dns 表达意图。
+根治在控制端（headscale 的 dns 节；官方 Tailscale 则在管理台 DNS 页
+做同样的事），本仓库用命令收敛，二选一：
+
+- `disable-magic-dns`——不需要 MagicDNS 就选它：tailnet 从此不推任何
+  DNS，客户端 accept-dns 开关随意，急修设的 false 也不必回改；
+- `enable-magic-dns`（默认基域 `ts.<域名>`，`--base-domain` 可指定；
+  全局解析器清空、`override_local_dns` 关闭）——想要 MagicDNS 就选
+  它，然后把客户端开关改回 `tailscale set --accept-dns=true` 并再清
+  一次缓存（命令同上）：此后 `<机器名>.ts.<域名>` 由 100.100.100.100
+  应答，其余查询回退给系统原 DNS（路由器/daed），本节故障不会复现。
+  MagicDNS 名字随 netmap 自动下发，客户端没看到就断开重连一次。
+
+注意 headscale 打包示例自带 `magic_dns: true` + 全局解析器
+1.1.1.1/1.0.0.1，`install` 原样透传——`status` 会以
+`dns-global-resolvers-pushed` 提示这一冲突，直到运行
+enable/disable-magic-dns 表达意图（意图记录在 state.json，apply/
+update 只收敛、绝不擅自翻转）。
 
 路由器侧无需改动：join 默认 `--accept-dns=false`，apply 与 failover
 都会收敛漂移，status 会把 accept-dns=true 标为 unsafe-accept-dns。
