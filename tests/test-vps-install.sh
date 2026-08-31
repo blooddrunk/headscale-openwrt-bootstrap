@@ -320,9 +320,9 @@ assert_file_contains "$CFG" 'region_code: "custom"'
 if log_has 'systemctl restart headscale'; then fail 'apply must not restart when the config already matches'; fi
 OUT=$(f_run plan)
 assert_contains "$OUT" 'requested version/embedded DERP: none/true (effective)'
-OUT=$(f_run status)
+OUT=$(f_run status || true)
 assert_contains "$OUT" 'embedded DERP=true, region=custom'
-OUT=$(f_run --json status)
+OUT=$(f_run --json status || true)
 assert_contains "$OUT" '"embedded_derp_region":"custom"'
 
 # F4. --enable-embedded-derp true drives the same convergence via apply.
@@ -339,7 +339,104 @@ f_run disable-derp >/dev/null
 assert_file_contains "$CFG" 'enabled: false'
 assert_file_contains "$CFG" 'region_code: "hs"'
 [ ! -f "$ROOT/.headscale-state/derp-enabled" ] || fail 'fixture STUN listener must be gone after disable-derp'
-OUT=$(f_run status)
+OUT=$(f_run status || true)
 assert_contains "$OUT" 'embedded DERP=false'
+
+################################################################
+# G. MagicDNS: opt-in management of the dns section.  The packaged
+#    baseline ships magic_dns: true + Cloudflare global resolvers that
+#    install must pass through untouched (status flags them), until
+#    enable-magic-dns/disable-magic-dns records its intent.
+################################################################
+
+make_fresh_root vps-g1
+CFG=$ROOT/etc/headscale/config.yaml
+f_run() {
+    env FAKE_SS_EMPTY=1 FAKE_VPS_ROOT="$ROOT" FAKE_LOG="$LOG" PATH="$VPS_BIN:$PATH" \
+        "$VPS_SCRIPT" --root "$ROOT" "$@"
+}
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 install >/dev/null
+
+# G0. install leaves the packaged dns defaults alone, and status reports the
+#     pushed global resolvers as a failure with the dedicated tag.
+assert_file_contains "$CFG" 'magic_dns: true'
+assert_file_contains "$CFG" 'base_domain: example.com'
+assert_file_contains "$CFG" 'override_local_dns: true'
+assert_file_contains "$CFG" '      - 1.1.1.1'
+OUT=$(f_run status || true)
+assert_contains "$OUT" 'dns-global-resolvers-pushed'
+assert_contains "$OUT" 'global=1.1.1.1'
+OUT=$(f_run plan)
+assert_contains "$OUT" 'MagicDNS intent/base_domain: unmanaged / n/a'
+
+# G1. apply with no recorded intent keeps the dns section byte-identical.
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 apply >/dev/null
+assert_file_contains "$CFG" 'override_local_dns: true'
+assert_file_contains "$CFG" '      - 1.0.0.1'
+
+# G2. enable-magic-dns derives ts.<domain>, rewrites the managed keys, and
+#     clears the global resolver list (consumed, not left orphaned).
+log_reset
+OUT=$(f_run --domain hs.example.com --expected-public-ip 203.0.113.10 enable-magic-dns)
+assert_contains "$OUT" 'base_domain=ts.hs.example.com'
+assert_file_contains "$CFG" 'magic_dns: true'
+assert_file_contains "$CFG" 'base_domain: "ts.hs.example.com"'
+assert_file_contains "$CFG" 'override_local_dns: false'
+assert_file_contains "$CFG" 'global: []'
+assert_file_contains "$CFG" 'split: {}'
+assert_file_contains "$CFG" 'search_domains: []'
+if grep -qF '1.1.1.1' "$CFG"; then fail 'enable-magic-dns must consume the packaged global resolver items'; fi
+if grep -qF '2606:4700:4700::1111' "$CFG"; then fail 'enable-magic-dns must consume the packaged IPv6 resolver items'; fi
+log_has 'systemctl restart headscale' || fail 'enable-magic-dns must restart after a config change'
+assert_file_contains "$ROOT/var/lib/headscale-bootstrap/state.json" '"magic_dns": "true"'
+assert_file_contains "$ROOT/var/lib/headscale-bootstrap/state.json" '"magic_dns_base_domain": "ts.hs.example.com"'
+
+# G3. status is clean of the dns reason now, and re-running is idempotent.
+OUT=$(f_run status || true)
+assert_not_contains "$OUT" 'dns-global-resolvers-pushed'
+assert_contains "$OUT" 'base_domain=ts.hs.example.com'
+OUT=$(f_run --json status)
+assert_contains "$OUT" '"dns_magic_dns":"true"'
+assert_contains "$OUT" '"dns_global_resolvers":""'
+assert_contains "$OUT" '"magic_dns_intent":"true"'
+log_reset
+f_run enable-magic-dns >/dev/null
+if log_has 'systemctl restart headscale'; then fail 'enable-magic-dns restarted with nothing to change'; fi
+
+# G4. apply preserves the recorded intent (no silent reset, no gratuitous
+#     restart).
+log_reset
+f_run --domain hs.example.com --expected-public-ip 203.0.113.10 apply >/dev/null
+assert_file_contains "$CFG" 'base_domain: "ts.hs.example.com"'
+assert_file_contains "$CFG" 'global: []'
+if log_has 'systemctl restart headscale'; then fail 'apply must not restart when the config already matches'; fi
+OUT=$(f_run plan)
+assert_contains "$OUT" 'MagicDNS intent/base_domain: true / ts.hs.example.com'
+
+# G5. an explicit --base-domain is kept across runs and state, and a value
+#     equal to the server domain is rejected.
+f_run --base-domain tail.internal.example.com enable-magic-dns >/dev/null
+assert_file_contains "$CFG" 'base_domain: "tail.internal.example.com"'
+OUT=$(f_run --base-domain hs.example.com enable-magic-dns 2>&1) && fail 'enable-magic-dns must reject the server domain as base domain' || true
+assert_contains "$OUT" 'must differ from the server_url domain'
+
+# G6. disable-magic-dns turns MagicDNS off but keeps the empty global list
+#     and the recorded base domain for a cheap re-enable.
+f_run disable-magic-dns >/dev/null
+assert_file_contains "$CFG" 'magic_dns: false'
+assert_file_contains "$CFG" 'global: []'
+assert_file_contains "$CFG" 'override_local_dns: false'
+assert_file_contains "$ROOT/var/lib/headscale-bootstrap/state.json" '"magic_dns": "false"'
+assert_file_contains "$ROOT/var/lib/headscale-bootstrap/state.json" '"magic_dns_base_domain": "tail.internal.example.com"'
+OUT=$(f_run status || true)
+assert_contains "$OUT" 'magic_dns=false'
+assert_not_contains "$OUT" 'dns-global-resolvers-pushed'
+
+# G7. re-enable after disable restores the recorded base domain (no rename).
+log_reset
+OUT=$(f_run enable-magic-dns)
+assert_contains "$OUT" 'base_domain=tail.internal.example.com'
+assert_file_contains "$CFG" 'base_domain: "tail.internal.example.com"'
+log_has 'systemctl restart headscale' || fail 're-enable must restart after a config change'
 
 printf 'VPS install/apply/1panel tests passed.\n'

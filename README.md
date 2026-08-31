@@ -296,11 +296,13 @@ subnet router 需在新服务器重新批准。
 | `purge` / `purge-identity`                        | 双端    | 破坏性操作，必须 `--yes-i-understand`，执行前做最终备份                                     |
 | `ensure-user` / `issue-key` / `approve-route`     | VPS     | 用户与注册密钥管理、路由批准                                                                |
 | `enable-derp` / `disable-derp`                    | VPS     | 开/关内置 DERP 中继：托管 region 键与公网 IPv4，重启后验证 UDP STUN 与 `/derp/probe`        |
+| `enable-magic-dns` / `disable-magic-dns`          | VPS     | 开/关 MagicDNS（默认基域 `ts.<域名>`，`--base-domain` 可指定）：托管 dns 键并保持全局解析器为空；`status` 对打包默认下发的全局解析器报 `dns-global-resolvers-pushed` |
 
 常用参数：VPS 侧 `--domain`、`--expected-public-ip`、`--proxy`、
 `--listen/--metrics-listen/--grpc-listen`、`--version`（跨 minor 的
 `update` 还需 `--yes` 确认）、`--enable-embedded-derp`、
-`--derp-region-code/--derp-region-name`、`--user`、`--expiration`、`--output`、
+`--derp-region-code/--derp-region-name`、`--base-domain`
+（enable-magic-dns 的 MagicDNS 基域）、`--user`、`--expiration`、`--output`、
 `--node-id`、`--route`；OpenWrt 侧
 `--login-server`、`--auth-key-file`、`--auth-key-stdin`、`--service-mode`、`--accept-dns`、
 `--accept-routes`、`--subnet`、`--min-client-version`、`--priority`、
@@ -437,7 +439,12 @@ tailscale set --accept-dns=false
 MagicDNS，可去控制端（官方管理台的 DNS 页，或 Headscale 配置的
 dns 节）移除全局解析器、或改为 split DNS——没有全局解析器时，
 100.100.100.100 只应答 MagicDNS 名字，其余查询回退给系统原 DNS
-（即路由器/daed），两者即可共存。
+（即路由器/daed），两者即可共存。Headscale 侧直接用本仓库的
+`enable-magic-dns`：它托管 dns 节、把全局解析器清空并把
+`override_local_dns` 关掉（默认基域 `ts.<域名>`）。注意 headscale
+打包示例自带 `magic_dns: true` + 全局解析器 1.1.1.1/1.0.0.1，
+`install` 原样透传——`status` 会以 `dns-global-resolvers-pushed`
+提示这一冲突，直到运行 enable/disable-magic-dns 表达意图。
 
 路由器侧无需改动：join 默认 `--accept-dns=false`，apply 与 failover
 都会收敛漂移，status 会把 accept-dns=true 标为 unsafe-accept-dns。

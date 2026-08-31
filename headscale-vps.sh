@@ -33,6 +33,7 @@ VPS_ENABLE_DERP=false
 VPS_ENABLE_DERP_EXPLICIT=0
 VPS_DERP_REGION_CODE_FLAG=
 VPS_DERP_REGION_NAME_FLAG=
+VPS_MAGIC_DNS_BASE_DOMAIN_FLAG=
 VPS_EXPECTED_PUBLIC_IP=
 VPS_KEY_EXPIRATION=2h
 VPS_KEY_OUTPUT=
@@ -73,6 +74,12 @@ Mutating commands (each backs up before writing, validates, then verifies):
                            restart (UDP STUN listener + /derp/probe).
   disable-derp             Turn the embedded DERP relay off; region keys and
                            derp.urls stay in place for a later re-enable.
+  enable-magic-dns         Enable MagicDNS with a dedicated --base-domain
+                           (default ts.<domain>): dns.magic_dns/base_domain
+                           become managed and dns.nameservers.global is kept
+                           empty so accept-dns clients keep their local DNS.
+  disable-magic-dns        Turn MagicDNS off; the global resolver list stays
+                           empty so nothing is pushed to accept-dns clients.
   update                   Upgrade Headscale (stable minors are never skipped).
   rollback [BACKUP_ID]     Restore config+data+package as one snapshot.
   cleanup                  Stop/disable Headscale, remove only script-owned
@@ -92,6 +99,8 @@ Options:
   --derp-region-code CODE   Embedded DERP region code (default: first domain
                            label with a leading "hs-" stripped).
   --derp-region-name NAME   Embedded DERP region name (default: "<Code> VPS").
+  --base-domain DOMAIN     MagicDNS base domain for enable-magic-dns
+                           (default: ts.<server domain>; must differ from it).
   --expected-public-ip IP   Optional DNS-to-VPS comparison input.
   --expiration DURATION     issue-key lifetime (default 2h)
   --output FILE             issue-key destination (mode 0600)
@@ -145,7 +154,7 @@ vps_need_value() {
 vps_parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            discover|plan|status|verify|backup|install|apply|update|rollback|cleanup|purge|ensure-user|issue-key|approve-route|enable-derp|disable-derp)
+            discover|plan|status|verify|backup|install|apply|update|rollback|cleanup|purge|ensure-user|issue-key|approve-route|enable-derp|disable-derp|enable-magic-dns|disable-magic-dns)
                 [ -z "$VPS_COMMAND" ] || die "multiple commands supplied: $VPS_COMMAND and $1"
                 VPS_COMMAND=$1
                 shift
@@ -211,6 +220,12 @@ vps_parse_args() {
                 shift 2
                 ;;
             --derp-region-name=*) VPS_DERP_REGION_NAME_FLAG=${1#*=}; shift ;;
+            --base-domain)
+                vps_need_value "$@"
+                VPS_MAGIC_DNS_BASE_DOMAIN_FLAG=$2
+                shift 2
+                ;;
+            --base-domain=*) VPS_MAGIC_DNS_BASE_DOMAIN_FLAG=${1#*=}; shift ;;
             --expected-public-ip)
                 vps_need_value "$@"
                 VPS_EXPECTED_PUBLIC_IP=$2
@@ -544,6 +559,34 @@ vps_collect_facts() {
     VPS_DETECTED_DOMAIN=
     [ "$VPS_CURRENT_SERVER_URL" != unknown ] && VPS_DETECTED_DOMAIN=$(vps_extract_domain_from_url "$VPS_CURRENT_SERVER_URL")
     VPS_EFFECTIVE_DOMAIN=${VPS_DOMAIN:-$VPS_DETECTED_DOMAIN}
+
+    VPS_CURRENT_MAGIC_DNS=
+    VPS_CURRENT_BASE_DOMAIN=
+    VPS_CURRENT_OVERRIDE_LOCAL_DNS=
+    VPS_CURRENT_GLOBAL_DNS=
+    if [ "$VPS_CONFIG_PRESENT" = yes ]; then
+        VPS_CURRENT_MAGIC_DNS=$(bootstrap_yaml_nested_scalar "$VPS_CONFIG_PATH" dns magic_dns)
+        VPS_CURRENT_BASE_DOMAIN=$(bootstrap_yaml_nested_scalar "$VPS_CONFIG_PATH" dns base_domain)
+        VPS_CURRENT_OVERRIDE_LOCAL_DNS=$(bootstrap_yaml_nested_scalar "$VPS_CONFIG_PATH" dns override_local_dns)
+        VPS_CURRENT_GLOBAL_DNS=$(bootstrap_yaml_triple_list "$VPS_CONFIG_PATH" dns nameservers global | tr '\n' ' ')
+    fi
+    [ -n "$VPS_CURRENT_MAGIC_DNS" ] || VPS_CURRENT_MAGIC_DNS=unknown
+    [ -n "$VPS_CURRENT_BASE_DOMAIN" ] || VPS_CURRENT_BASE_DOMAIN=unknown-or-empty
+    [ -n "$VPS_CURRENT_OVERRIDE_LOCAL_DNS" ] || VPS_CURRENT_OVERRIDE_LOCAL_DNS=unknown
+    [ -n "$(printf '%s\n' "$VPS_CURRENT_GLOBAL_DNS" | tr -d '[:space:]')" ] || VPS_CURRENT_GLOBAL_DNS=
+
+    # MagicDNS intent is opt-in and sticky: enable-magic-dns/disable-magic-dns
+    # record it in state.json, and only then do install/apply/update manage
+    # the dns section.  Until then the packaged dns defaults pass through
+    # untouched (status flags the pushed global resolvers separately).
+    VPS_MAGIC_DNS_EFFECTIVE=unmanaged
+    VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE=
+    vps_md_state=$(state_read_field "$(state_path_vps)" magic_dns)
+    case "$vps_md_state" in
+        true|false) VPS_MAGIC_DNS_EFFECTIVE=$vps_md_state ;;
+    esac
+    VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE=$(state_read_field "$(state_path_vps)" magic_dns_base_domain)
+
     vps_collect_dns
 
     VPS_DOCKER_OPENRESTY=no
@@ -705,6 +748,10 @@ vps_print_text_discover() {
     if [ "$VPS_CURRENT_DERP_ENABLED" = true ]; then
         printf '  embedded DERP region/stun: %s / %s\n' "${VPS_CURRENT_DERP_REGION:-unknown}" "${VPS_CURRENT_DERP_STUN:-unknown}"
     fi
+    printf '  dns: magic_dns=%s base_domain=%s override_local=%s global=%s\n' \
+        "$VPS_CURRENT_MAGIC_DNS" "$VPS_CURRENT_BASE_DOMAIN" \
+        "$VPS_CURRENT_OVERRIDE_LOCAL_DNS" "${VPS_CURRENT_GLOBAL_DNS:-none}"
+    printf '  MagicDNS intent (state.json): %s\n' "$VPS_MAGIC_DNS_EFFECTIVE"
     printf '  effective domain: %s\n' "${VPS_EFFECTIVE_DOMAIN:-unknown}"
     printf '  DNS: %s; match=%s; addresses=%s\n' "$VPS_DNS_STATUS" "$VPS_DNS_MATCH" "${VPS_DNS_IPS:-none}"
     printf '  listeners 80/443: %s/%s\n' "$VPS_PORT_80" "$VPS_PORT_443"
@@ -743,6 +790,11 @@ vps_print_json_discover() {
     bootstrap_json_field trusted_proxies "$VPS_CURRENT_TRUSTED_PROXIES"
     bootstrap_json_field embedded_derp_enabled "$VPS_CURRENT_DERP_ENABLED"
     bootstrap_json_field embedded_derp_region "${VPS_CURRENT_DERP_REGION:-}"
+    bootstrap_json_field dns_magic_dns "$VPS_CURRENT_MAGIC_DNS"
+    bootstrap_json_field dns_base_domain "${VPS_CURRENT_BASE_DOMAIN:-}"
+    bootstrap_json_field dns_override_local "$VPS_CURRENT_OVERRIDE_LOCAL_DNS"
+    bootstrap_json_field dns_global_resolvers "${VPS_CURRENT_GLOBAL_DNS:-}"
+    bootstrap_json_field magic_dns_intent "$VPS_MAGIC_DNS_EFFECTIVE"
     bootstrap_json_field domain "${VPS_EFFECTIVE_DOMAIN:-unknown}"
     bootstrap_json_field dns_status "$VPS_DNS_STATUS"
     bootstrap_json_field dns_match "$VPS_DNS_MATCH"
@@ -883,6 +935,8 @@ vps_plan() {
         bootstrap_json_field requested_version "${VPS_VERSION:-none}"
         bootstrap_json_field requested_embedded_derp "$VPS_ENABLE_DERP"
         bootstrap_json_field effective_embedded_derp "$VPS_DERP_EFFECTIVE"
+        bootstrap_json_field magic_dns_intent "$VPS_MAGIC_DNS_EFFECTIVE"
+        bootstrap_json_field magic_dns_base_domain "${VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE:-}"
         bootstrap_json_field dns_status "$VPS_DNS_STATUS"
         bootstrap_json_field dns_match "$VPS_DNS_MATCH"
         bootstrap_json_field blocked_reasons "${vps_block_reasons# }"
@@ -895,6 +949,7 @@ vps_plan() {
         printf '  domain: %s\n' "${VPS_EFFECTIVE_DOMAIN:-unknown}"
         printf '  proxy requested/effective: %s/%s\n' "$VPS_PROXY_MODE" "$VPS_EFFECTIVE_PROXY"
         printf '  requested version/embedded DERP: %s/%s (effective)\n' "${VPS_VERSION:-none}" "$VPS_DERP_EFFECTIVE"
+        printf '  MagicDNS intent/base_domain: %s / %s\n' "$VPS_MAGIC_DNS_EFFECTIVE" "${VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE:-n/a}"
         printf '  Headscale config/data: %s/%s\n' "$VPS_CONFIG_PRESENT" "$VPS_DATA_PRESENT"
         printf '  public listeners 80/443: %s/%s\n' "$VPS_PORT_80" "$VPS_PORT_443"
         printf '  admin listeners 8080/9090/50443: %s/%s/%s\n' "$VPS_PORT_8080" "$VPS_PORT_9090" "$VPS_PORT_50443"
@@ -1008,6 +1063,11 @@ vps_status() {
                VPS_STATUS_REASONS="$VPS_STATUS_REASONS derp-enabled-but-stun-not-listening" ;;
         esac
     fi
+    vps_status_global_dns=$(printf '%s\n' "$VPS_CURRENT_GLOBAL_DNS" | tr -d '[:space:]')
+    if [ "$VPS_CONFIG_PRESENT" = yes ] && [ -n "$vps_status_global_dns" ]; then
+        VPS_STATUS_CODE=2
+        VPS_STATUS_REASONS="$VPS_STATUS_REASONS dns-global-resolvers-pushed"
+    fi
 
     if [ "$BOOTSTRAP_JSON" = 1 ]; then
         bootstrap_json_start
@@ -1021,6 +1081,10 @@ vps_status() {
         bootstrap_json_field safety "$VPS_SAFE_CONFIG"
         bootstrap_json_field safety_reasons "${VPS_STATUS_REASONS# }"
         bootstrap_json_field embedded_derp_region "${VPS_CURRENT_DERP_REGION:-}"
+        bootstrap_json_field dns_magic_dns "$VPS_CURRENT_MAGIC_DNS"
+        bootstrap_json_field dns_base_domain "${VPS_CURRENT_BASE_DOMAIN:-}"
+        bootstrap_json_field dns_global_resolvers "${VPS_CURRENT_GLOBAL_DNS:-}"
+        bootstrap_json_field magic_dns_intent "$VPS_MAGIC_DNS_EFFECTIVE"
         if [ "$VPS_STATUS_CODE" -eq 0 ]; then bootstrap_json_bool_field ok true; else bootstrap_json_bool_field ok false; fi
         bootstrap_json_end
     else
@@ -1032,6 +1096,9 @@ vps_status() {
         printf '  public /health: %s\n' "$VPS_PUBLIC_HEALTH"
         printf '  listeners admin 8080/9090/50443: %s/%s/%s\n' "$VPS_PORT_8080" "$VPS_PORT_9090" "$VPS_PORT_50443"
         printf '  UDP 3478: %s (embedded DERP=%s, region=%s)\n' "$VPS_PORT_3478_UDP" "$VPS_CURRENT_DERP_ENABLED" "${VPS_CURRENT_DERP_REGION:-n/a}"
+        printf '  dns: magic_dns=%s, base_domain=%s, global=%s, override_local=%s\n' \
+            "$VPS_CURRENT_MAGIC_DNS" "$VPS_CURRENT_BASE_DOMAIN" \
+            "${VPS_CURRENT_GLOBAL_DNS:-none}" "$VPS_CURRENT_OVERRIDE_LOCAL_DNS"
         printf '  safety: %s (%s)\n' "$VPS_SAFE_CONFIG" "$VPS_CONFIG_SAFETY_REASON"
         if [ "$VPS_STATUS_CODE" -eq 0 ]; then
             printf 'OK\n'
@@ -1080,6 +1147,8 @@ vps_main() {
         approve-route) vps_approve_route ;;
         enable-derp) vps_enable_derp ;;
         disable-derp) vps_disable_derp ;;
+        enable-magic-dns) vps_enable_magic_dns ;;
+        disable-magic-dns) vps_disable_magic_dns ;;
         update) vps_update ;;
         rollback) vps_rollback ;;
         cleanup) vps_cleanup ;;

@@ -161,11 +161,29 @@ vps_render_config() {
     # consumed so no orphaned items remain.  While the embedded DERP is
     # enabled, the region identity keys and derp.server.ipv4 are managed too
     # (the packaged documentation values 198.51.100.1 / 2001:db8::1 would
-    # otherwise leak into the DERP map handed to clients).
+    # otherwise leak into the DERP map handed to clients).  Once MagicDNS
+    # intent is recorded (enable-magic-dns/disable-magic-dns), dns.magic_dns,
+    # dns.base_domain, dns.override_local_dns, and dns.nameservers.global
+    # are managed as well: the packaged example ships global resolvers
+    # (1.1.1.1/1.0.0.1) that would hijack every accept-dns=true LAN client
+    # away from the local resolver (daed/dae), so they are normalized to an
+    # empty list.
     render_src=$1
     render_dst=$2
     render_manage_tls=true
     [ "$VPS_EFFECTIVE_PROXY" = none ] && render_manage_tls=false
+    render_dns_managed=
+    render_dns_base=
+    case "$VPS_MAGIC_DNS_EFFECTIVE" in
+        true|false)
+            render_dns_managed=$VPS_MAGIC_DNS_EFFECTIVE
+            render_dns_base=$VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE
+            ;;
+    esac
+    if [ "$render_dns_managed" = true ] && [ -z "$render_dns_base" ]; then
+        log_error 'MagicDNS is on but no base domain is known; re-run enable-magic-dns with --base-domain'
+        return 1
+    fi
     VPS_DERP_IPV4=
     if [ "$VPS_DERP_EFFECTIVE" = true ]; then
         vps_derp_region_defaults "$render_src" || return 1
@@ -183,15 +201,30 @@ vps_render_config() {
         -v derp_region_code="$VPS_DERP_REGION_CODE" \
         -v derp_region_name="$VPS_DERP_REGION_NAME" \
         -v derp_ipv4="$VPS_DERP_IPV4" \
-        -v manage_tls="$render_manage_tls" '
+        -v manage_tls="$render_manage_tls" \
+        -v dns_managed="$render_dns_managed" \
+        -v dns_base="$render_dns_base" '
         function indent_of(s, n) { n = 0; while (substr(s, n + 1, 1) == " ") n++; return n }
         {
             line = $0
             ind = indent_of(line)
             if (consume_tp && line ~ /^[[:space:]]*-/) next
             consume_tp = 0
+            if (consume_dns_global && line ~ /^[[:space:]]*-/) next
+            consume_dns_global = 0
             if (in_derp_server && ind <= server_indent && line !~ /^[[:space:]]*$/) in_derp_server = 0
             if (in_derp && ind <= derp_indent && line !~ /^[[:space:]]*$/) { in_derp = 0; in_derp_server = 0 }
+            if (in_dns && ind <= dns_indent && line !~ /^[[:space:]]*$/) {
+                # Leaving the dns block: append managed keys a hand-trimmed
+                # baseline might lack, so the intent never silently no-ops.
+                if (dns_managed != "") {
+                    if (!saw["dns_magic"]) printf "%*smagic_dns: %s\n", dns_indent + 2, "", dns_managed
+                    if (dns_managed == "true" && dns_base != "" && !saw["dns_base"]) printf "%*sbase_domain: \"%s\"\n", dns_indent + 2, "", dns_base
+                    if (!saw["dns_override"]) printf "%*soverride_local_dns: false\n", dns_indent + 2, ""
+                    if (saw["dns_nameservers"] && !saw["dns_global"]) printf "%*sglobal: []\n", dns_indent + 4, ""
+                }
+                in_dns = 0
+            }
             if (line ~ /^server_url[[:space:]]*:/) { print "server_url: " server_url; saw["server_url"] = 1; next }
             if (line ~ /^listen_addr[[:space:]]*:/) { print "listen_addr: " listen_addr; saw["listen_addr"] = 1; next }
             if (line ~ /^metrics_listen_addr[[:space:]]*:/) { print "metrics_listen_addr: " metrics_addr; saw["metrics_listen_addr"] = 1; next }
@@ -245,6 +278,29 @@ vps_render_config() {
                     next
                 }
             }
+            if (line ~ /^[[:space:]]*dns[[:space:]]*:/) { dns_indent = ind; in_dns = 1; saw_dns_section = 1; print; next }
+            if (in_dns && dns_managed != "" && line ~ /^[[:space:]]*magic_dns[[:space:]]*:/) {
+                printf "%*smagic_dns: %s\n", dns_indent + 2, "", dns_managed
+                saw["dns_magic"] = 1
+                next
+            }
+            if (in_dns && dns_managed == "true" && dns_base != "" && line ~ /^[[:space:]]*base_domain[[:space:]]*:/) {
+                printf "%*sbase_domain: \"%s\"\n", dns_indent + 2, "", dns_base
+                saw["dns_base"] = 1
+                next
+            }
+            if (in_dns && dns_managed != "" && line ~ /^[[:space:]]*override_local_dns[[:space:]]*:/) {
+                printf "%*soverride_local_dns: false\n", dns_indent + 2, ""
+                saw["dns_override"] = 1
+                next
+            }
+            if (in_dns && line ~ /^[[:space:]]*nameservers[[:space:]]*:/) { saw["dns_nameservers"] = 1; print; next }
+            if (in_dns && dns_managed != "" && saw["dns_nameservers"] && line ~ /^[[:space:]]*global[[:space:]]*:/) {
+                printf "%*sglobal: []\n", dns_indent + 4, ""
+                saw["dns_global"] = 1
+                consume_dns_global = 1
+                next
+            }
             print
         }
         END {
@@ -264,11 +320,39 @@ vps_render_config() {
                 print "render: derp.server baseline lacks the enabled/region_code/ipv4 keys; refusing to guess" > "/dev/stderr"
                 exit 1
             }
+            # EOF while still inside the dns block (or no dns block at all):
+            # append the managed keys the baseline did not carry.
+            if (dns_managed != "") {
+                if (!saw_dns_section) print "dns:"
+                if (!saw["dns_magic"] || !saw_dns_section) print "  magic_dns: " dns_managed
+                if (dns_managed == "true" && dns_base != "" && (!saw["dns_base"] || !saw_dns_section)) print "  base_domain: \"" dns_base "\""
+                if (!saw["dns_override"] || !saw_dns_section) print "  override_local_dns: false"
+                if (!saw["dns_nameservers"] && !saw["dns_global"]) {
+                    print "  nameservers:"
+                    print "    global: []"
+                }
+            }
         }
     ' "$render_src" > "$render_dst" || return 1
     if [ "$VPS_DERP_EFFECTIVE" = true ]; then
         [ -n "$(bootstrap_yaml_triple_scalar "$render_dst" derp server stun_listen_addr)" ] || {
             log_error 'derp.server has no stun_listen_addr; the packaged baseline is expected to provide one'
+            return 1
+        }
+    fi
+    if [ -n "$render_dns_managed" ]; then
+        # Read the rendered dns section back: a hand-trimmed baseline must
+        # fail loudly here (configtest would only catch syntax, not intent).
+        [ "$(bootstrap_yaml_nested_scalar "$render_dst" dns magic_dns)" = "$render_dns_managed" ] || {
+            log_error "rendered dns.magic_dns is not $render_dns_managed; refusing to write an unmanaged config"
+            return 1
+        }
+        [ "$(bootstrap_yaml_nested_scalar "$render_dst" dns override_local_dns)" = false ] || {
+            log_error 'rendered dns.override_local_dns is not false'
+            return 1
+        }
+        [ -z "$(bootstrap_yaml_triple_list "$render_dst" dns nameservers global)" ] || {
+            log_error 'rendered dns.nameservers.global is not empty'
             return 1
         }
     fi
@@ -419,7 +503,9 @@ vps_write_state() {
         metrics_listen "$VPS_METRICS_LISTEN" \
         grpc_listen "$VPS_GRPC_LISTEN" \
         embedded_derp "$VPS_DERP_EFFECTIVE" \
-        derp_region "${vps_ws_region:-n/a}" || die 'failed to write state.json'
+        derp_region "${vps_ws_region:-n/a}" \
+        magic_dns "${VPS_MAGIC_DNS_EFFECTIVE:-unmanaged}" \
+        magic_dns_base_domain "${VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE:-}" || die 'failed to write state.json'
     log_change "state.json updated: $(state_path_vps)"
 }
 
@@ -554,10 +640,12 @@ vps_apply() {
     vps_write_state
 }
 
-vps_derp_converge_config() {
-    # Shared body for enable-derp/disable-derp: render (with the explicit
-    # flag applied), skip the restart when nothing changes, otherwise run the
-    # standard config transaction + verified restart.
+vps_converge_config() {
+    # vps_converge_config LABEL — shared body for the enable/disable commands:
+    # render (with the command's explicit intent applied), skip the restart
+    # when nothing changes, otherwise run the standard config transaction +
+    # verified restart.
+    vps_cc_label=$1
     vps_tmp_config=${TMPDIR:-/tmp}/headscale-config.$$.yaml
     vps_render_config "$VPS_CONFIG_PATH" "$vps_tmp_config" || {
         rm -f "$vps_tmp_config"
@@ -565,7 +653,7 @@ vps_derp_converge_config() {
     }
     if cmp -s "$vps_tmp_config" "$VPS_CONFIG_PATH"; then
         rm -f "$vps_tmp_config"
-        log_info 'config already matches the requested embedded DERP state; no restart'
+        log_info "config already matches the requested $vps_cc_label; no restart"
         return 0
     fi
     vps_config_write_transaction "$vps_tmp_config" || {
@@ -575,6 +663,10 @@ vps_derp_converge_config() {
     rm -f "$vps_tmp_config"
     vps_restart_and_verify || die 'restart/health verification failed'
     return 0
+}
+
+vps_derp_converge_config() {
+    vps_converge_config 'embedded DERP state'
 }
 
 vps_derp_stun_port() {
@@ -628,6 +720,63 @@ vps_disable_derp() {
     log_change 'embedded DERP disabled (region keys and derp.urls preserved)'
     vps_write_state
     printf 'Embedded DERP disabled.  Region keys and derp.urls were preserved; clients fall back to derp.urls on the next netmap update.\n'
+}
+
+vps_magic_dns_base_domain_resolve() {
+    # Priority: explicit flag, then the identity already recorded in state
+    # (so apply/update never rename a chosen base domain), then a fresh
+    # derivation ("ts." + the server_url domain).  The packaged placeholder
+    # example.com never counts as a chosen identity.
+    vps_md_domain=$VPS_MAGIC_DNS_BASE_DOMAIN_FLAG
+    [ -n "$vps_md_domain" ] || vps_md_domain=$VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE
+    if [ -z "$vps_md_domain" ] || [ "$vps_md_domain" = example.com ]; then
+        [ -n "$VPS_EFFECTIVE_DOMAIN" ] || die 'cannot derive a MagicDNS base domain: pass --base-domain (and --domain when the config is unreadable)'
+        vps_md_domain="ts.$VPS_EFFECTIVE_DOMAIN"
+    fi
+    case "$vps_md_domain" in
+        *[!A-Za-z0-9.-]*|.*|*.|*..*) die "invalid MagicDNS base domain: $vps_md_domain" ;;
+    esac
+    [ "$vps_md_domain" != "$VPS_EFFECTIVE_DOMAIN" ] || {
+        die "the MagicDNS base domain must differ from the server_url domain ($VPS_EFFECTIVE_DOMAIN); use a dedicated subdomain such as ts.$VPS_EFFECTIVE_DOMAIN"
+    }
+    printf '%s\n' "$vps_md_domain"
+}
+
+vps_enable_magic_dns() {
+    vps_require_root_real
+    vps_conflict_or_die
+    [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed; run install first'
+    [ "$VPS_CONFIG_PRESENT" = yes ] || die "no config at $VPS_CONFIG_PATH; run install/apply first"
+
+    VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE=$(vps_magic_dns_base_domain_resolve)
+    VPS_MAGIC_DNS_EFFECTIVE=true
+
+    # While MagicDNS intent is recorded, the renderer also normalizes
+    # dns.nameservers.global to [] and override_local_dns to false: pushing
+    # global resolvers would reroute ALL DNS of every accept-dns=true LAN
+    # client (e.g. a PC behind daed/dae) to those resolvers — the exact
+    # failure mode this command exists to avoid.
+    vps_converge_config 'MagicDNS state'
+
+    log_change "MagicDNS enabled (base_domain $VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE, global resolvers kept empty)"
+    vps_write_state
+    printf 'MagicDNS enabled: base_domain=%s.\n' "$VPS_MAGIC_DNS_BASE_DOMAIN_EFFECTIVE"
+    printf 'dns.nameservers.global stays empty, so accept-dns=true clients keep their local resolver for everything except tailnet names.\n'
+    printf 'Clients that want MagicDNS names must run with accept-dns=true (the client default); names arrive with the next netmap update.\n'
+}
+
+vps_disable_magic_dns() {
+    vps_require_root_real
+    vps_conflict_or_die
+    [ "$VPS_HEADSCALE_VERSION" != absent ] || die 'headscale is not installed'
+    [ "$VPS_CONFIG_PRESENT" = yes ] || die "no config at $VPS_CONFIG_PATH; run install/apply first"
+
+    VPS_MAGIC_DNS_EFFECTIVE=false
+    vps_converge_config 'MagicDNS state'
+
+    log_change 'MagicDNS disabled (base_domain kept in state for a cheap re-enable; global resolvers stay empty)'
+    vps_write_state
+    printf 'MagicDNS disabled.  dns.nameservers.global stays empty, so nothing is pushed to accept-dns clients either way.\n'
 }
 
 vps_proxy_backup_files() {

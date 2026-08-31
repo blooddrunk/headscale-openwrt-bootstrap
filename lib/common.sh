@@ -168,6 +168,63 @@ bootstrap_yaml_triple_scalar() {
     ' "$bootstrap_yaml_file" 2>/dev/null | bootstrap_strip_yaml_scalar
 }
 
+bootstrap_yaml_triple_list() {
+    # bootstrap_yaml_triple_list FILE TOP MIDDLE CHILD — print the "- item"
+    # entries of the list under TOP -> MIDDLE -> CHILD, one per line.
+    bootstrap_yaml_file=$1
+    bootstrap_yaml_top=$2
+    bootstrap_yaml_middle=$3
+    bootstrap_yaml_child=$4
+    [ -r "$bootstrap_yaml_file" ] || return 1
+
+    awk -v top="$bootstrap_yaml_top" -v middle="$bootstrap_yaml_middle" -v child="$bootstrap_yaml_child" '
+        function indent(line, n) {
+            n=0
+            while (substr(line, n + 1, 1) == " ") n++
+            return n
+        }
+        {
+            line_indent=indent($0)
+            if ($0 ~ "^[[:space:]]*" top "[[:space:]]*:") {
+                top_indent=line_indent
+                in_top=1
+                in_middle=0
+                in_child=0
+                next
+            }
+            if (in_top && line_indent <= top_indent && $0 !~ /^[[:space:]]*$/) {
+                in_top=0
+                in_middle=0
+                in_child=0
+            }
+            if (in_top && $0 ~ "^[[:space:]]*" middle "[[:space:]]*:") {
+                middle_indent=line_indent
+                in_middle=1
+                in_child=0
+                next
+            }
+            if (in_middle && line_indent <= middle_indent && $0 !~ /^[[:space:]]*$/) {
+                in_middle=0
+                in_child=0
+            }
+            if (in_middle && $0 ~ "^[[:space:]]*" child "[[:space:]]*:") {
+                child_indent=line_indent
+                in_child=1
+                next
+            }
+            if (in_child) {
+                if (line_indent <= child_indent && $0 !~ /^[[:space:]]*$/) { exit }
+                if ($0 ~ /^[[:space:]]*-[[:space:]]*/) {
+                    item=$0
+                    sub(/^[[:space:]]*-[[:space:]]*/, "", item)
+                    sub(/[[:space:]]+#.*$/, "", item)
+                    print item
+                }
+            }
+        }
+    ' "$bootstrap_yaml_file" 2>/dev/null
+}
+
 bootstrap_json_escape() {
     # Values are summaries, never raw secret files.  Still escape all JSON
     # control characters so an unexpected newline cannot corrupt --json.
@@ -402,6 +459,8 @@ bootstrap_reason_hint() {
             printf 'the local /health endpoint did not answer 200. Fix: journalctl -u headscale; check listen_addr in the config.' ;;
         public-health-*)
             printf 'the public https://DOMAIN/health endpoint did not answer 200. Fix: check DNS, the reverse proxy, and TLS certificates.' ;;
+        dns-global-resolvers-pushed)
+            printf 'dns.nameservers.global is not empty, so every accept-dns=true client gets ALL its DNS rerouted to those resolvers (breaks LAN devices behind daed/dae). Fix: run enable-magic-dns (or disable-magic-dns), or empty dns.nameservers.global in /etc/headscale/config.yaml.' ;;
     esac
 }
 
