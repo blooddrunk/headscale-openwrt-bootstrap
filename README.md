@@ -457,6 +457,45 @@ update 只收敛、绝不擅自翻转）。
 都会收敛漂移，status 会把 accept-dns=true 标为 unsafe-accept-dns。
 LAN 客户端设备不归脚本管，需如上逐台手动设置。
 
+### LAN 客户端 accept-routes 吃掉本机网段（子网路由接管冲突）
+
+DNS 之外还有路由接管，且只影响"LAN 内部、自己也在跑 Tailscale"的
+客户端：site-to-site 设计里 OpenWrt 向 tailnet 通告自家 LAN（如
+192.168.10.0/24），LAN 内的客户端若 accept-routes=true，会把这条
+"自家网段"的子网路由装到本地——Windows 上 Tailscale 侧 metric 极低
+（实测 5），压过物理网卡 on-link 路由（实测 281）。此后该客户端发往
+网关与同网段设备的流量全部先被送进 tailnet，绕到路由器的 tailscaled
+再发夹回 LAN。
+
+实测后果（2026-08，Windows PC + 企业 SDP/WireGuard 客户端共存）：
+依赖物理网关与局域网时序的第三方隧道客户端（默认网关探测、网关
+/32 钉扎路由、路由器 DNS、SPA 敲门后的短放行窗口）在路由被抢后
+重连握手大量失败；已建立的隧道反而存活（去公网网关的 UDP 走默认
+路由，不经被抢网段）。于是表现为"先连 SDP 再连 Tailscale 相安
+无事，先连 Tailscale 再连 SDP 必挂"。顺带说明： wg0 类 overlay 若
+声明整个 100.64.0.0/10（CGNAT 段），与 Tailscale 共存靠的是后者
+逐节点装 /32、最长前缀获胜——属于侥幸平衡，不要依赖。
+
+处理：LAN 内部客户端直接拒绝子网路由：
+
+```sh
+tailscale set --accept-routes=false
+```
+
+代价仅是该客户端看不到 tailnet 的其他子网路由（本 tailnet 即
+192.168.6.0/24 与 192.168.100.0/24）；它所在网段本就不需要 tailnet
+路由，节点间 100.64.0.x 直连与日后使用 exit node 均不受此开关影响
+（官方说明 accept-routes 不作用于 exit node）。结合上一节，LAN
+客户端的收敛配置是两个开关一起关：
+
+```sh
+tailscale set --accept-dns=false --accept-routes=false
+```
+
+若个别 LAN 客户端确实需要经 tailnet 访问其他子网，在 headscale
+ACL 里按源节点收窄可见的 dst 网段（不给它下发自家网段），从源头
+避免"自己网段被通告给自己"。
+
 ## 备份与回退
 
 - VPS 默认备份目录：`/var/backups/headscale-bootstrap/`
